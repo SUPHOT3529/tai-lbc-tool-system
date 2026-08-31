@@ -36,7 +36,9 @@
   Postgres table that every device reads/writes, and a Realtime subscription
   pushes an update event to every open tab the instant any device changes
   data -- no manual refresh needed. Only the personal login "remember me"
-  session stays in localStorage per-device.
+  session stays in localStorage per-device. When the network drops, writes
+  are queued in this browser's localStorage and replayed automatically once
+  connectivity returns (see the offline-queue logic in the app source).
 -->
 <script>
   var SUPABASE_URL = 'https://cqhdopicqwelxemocycw.supabase.co';
@@ -123,7 +125,8 @@ import {
   Zap, Ruler, ShieldCheck, ArrowLeftRight, Building2, ChevronRight,
   UserCircle2, CircleCheck, TriangleAlert, Loader2, QrCode, CreditCard,
   Camera, VideoOff, Download, LogOut, KeyRound, Eye, EyeOff, ArrowLeft, ShieldCheck as ShieldCheckAlt, Lock,
-  ShieldAlert, Bell, History, Settings as SettingsIcon, Image as ImageIcon, Wrench as WrenchIcon2
+  ShieldAlert, Bell, History, Settings as SettingsIcon, Image as ImageIcon, Wrench as WrenchIcon2,
+  Wifi, WifiOff
 } from 'lucide-react';
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, CartesianGrid, Legend
@@ -245,6 +248,12 @@ function ensureHtml2Canvas() {
   if (typeof window !== 'undefined' && window.html2canvas) return Promise.resolve();
   return loadScriptOnce(HTML2CANVAS_SRC, (p) => { html2canvasLoadPromise = p; }, () => html2canvasLoadPromise);
 }
+const JSZIP_SRC = 'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js';
+let jsZipLoadPromise = null;
+function ensureJsZip() {
+  if (typeof window !== 'undefined' && window.JSZip) return Promise.resolve();
+  return loadScriptOnce(JSZIP_SRC, (p) => { jsZipLoadPromise = p; }, () => jsZipLoadPromise);
+}
 
 function uid(prefix) {
   return prefix + '-' + Date.now().toString(36).slice(-4).toUpperCase() + Math.random().toString(36).slice(2, 5).toUpperCase();
@@ -282,6 +291,40 @@ async function storageGetStrict(key, shared = true) {
   const r = await window.storage.get(key, shared);
   return r ? r.value : null;
 }
+
+// ---- Offline support: a lightweight local queue for shared writes ----
+// When the shared backend is unreachable, writes get parked here (in this
+// browser's own localStorage — always available, never depends on the
+// network) instead of being lost or blocking the UI. They're replayed
+// automatically the moment connectivity returns.
+const OFFLINE_QUEUE_PREFIX = 'tai_lbc_offline_queue:';
+const OFFLINE_QUEUE_INDEX_KEY = 'tai_lbc_offline_queue_index';
+function queueOfflineWrite(storageKey, jsonValue) {
+  try {
+    localStorage.setItem(OFFLINE_QUEUE_PREFIX + storageKey, jsonValue);
+    const idx = readOfflineQueueIndex();
+    if (!idx.includes(storageKey)) { idx.push(storageKey); localStorage.setItem(OFFLINE_QUEUE_INDEX_KEY, JSON.stringify(idx)); }
+  } catch (e) { console.error('failed to queue offline write', e); }
+}
+function readOfflineQueueIndex() {
+  try { return JSON.parse(localStorage.getItem(OFFLINE_QUEUE_INDEX_KEY) || '[]'); } catch (e) { return []; }
+}
+function removeFromOfflineQueue(storageKey) {
+  try {
+    localStorage.removeItem(OFFLINE_QUEUE_PREFIX + storageKey);
+    localStorage.setItem(OFFLINE_QUEUE_INDEX_KEY, JSON.stringify(readOfflineQueueIndex().filter(k => k !== storageKey)));
+  } catch (e) { /* ignore */ }
+}
+// Distinguishes "internet/backend unreachable" (safe to queue and retry
+// later) from a genuine backend error like a bad RLS policy or schema
+// mismatch (must surface immediately — queuing that forever would silently
+// and permanently lose the write while looking like it "will sync later").
+function isNetworkError(err) {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return true;
+  const msg = String((err && err.message) || err || '').toLowerCase();
+  return msg.includes('fetch') || msg.includes('network') || msg.includes('timeout') || msg.includes('internet') || msg.includes('load failed');
+}
+
 // IMPORTANT: this must NOT swallow errors. A failed write silently treated as
 // success is exactly what causes "I added it but it's gone after I log back
 // in" — the UI shows success while the database was never actually updated.
@@ -398,10 +441,13 @@ function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState(null);
   const [authRetryCount, setAuthRetryCount] = useState(0);
+  const [isOnline, setIsOnline] = useState(typeof navigator === 'undefined' || navigator.onLine !== false);
+  const [pendingSyncKeys, setPendingSyncKeys] = useState(() => readOfflineQueueIndex());
+  const [syncing, setSyncing] = useState(false);
   const [users, setUsers] = useState([]);
   const [session, setSession] = useState(null); // { username, role, staffId }
   const [changePwOpen, setChangePwOpen] = useState(false);
-  const [settings, setSettingsState] = useState({ maxBorrowPerStaff: 3, defaultDueDays: 7 });
+  const [settings, setSettingsState] = useState({ maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null });
   const [auditLog, setAuditLog] = useState([]);
 
   useEffect(() => {
@@ -448,7 +494,31 @@ function App() {
     })();
   }, [authRetryCount]);
 
-  const persistUsers = useCallback(async (next) => { await storageSet(STORAGE_KEYS.USERS, JSON.stringify(next), true); setUsers(next); }, []);
+  // Central helper behind every persistX function below: write to the shared
+  // backend first (so local state is never optimistic-ahead of a write that
+  // might fail for a real reason), but if the backend is genuinely
+  // unreachable (offline / connectivity drop), don't block the user or lose
+  // their change — park it locally and update state immediately, then let
+  // the offline-queue flusher (see below) sync it the moment the network is
+  // back. A real backend error (not a connectivity issue) still throws, so
+  // callers keep showing a proper error instead of silently "succeeding."
+  const persistCollection = useCallback(async (storageKey, next, setState, shared = true) => {
+    const json = JSON.stringify(next);
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) {
+      try {
+        await storageSet(storageKey, json, shared);
+        setState(next);
+        return;
+      } catch (err) {
+        if (!isNetworkError(err)) throw err;
+      }
+    }
+    queueOfflineWrite(storageKey, json);
+    setState(next);
+    setPendingSyncKeys(readOfflineQueueIndex());
+  }, []);
+
+  const persistUsers = useCallback((next) => persistCollection(STORAGE_KEYS.USERS, next, setUsers, true), [persistCollection]);
 
   async function login(username, password, remember) {
     const uname = username.trim();
@@ -531,7 +601,9 @@ function App() {
         const toolsData = toolsDataRaw.map(tl => tl.warehouseId ? tl : { ...tl, warehouseId: warehousesData[0]?.id || null });
         const staffData = s ? JSON.parse(s) : SEED_STAFF;
         const txData = x ? JSON.parse(x) : seedTx(toolsData, staffData);
-        const settingsData = cfg ? JSON.parse(cfg) : { maxBorrowPerStaff: 3, defaultDueDays: 7 };
+        const settingsData = cfg
+          ? { maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null, ...JSON.parse(cfg) }
+          : { maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null };
         const auditData = log ? JSON.parse(log) : [];
         // Only seed (and write back) collections that genuinely came back empty on a
         // successful read — never as a reaction to a failed/thrown read (see the
@@ -552,7 +624,7 @@ function App() {
     })();
   }, [session, authRetryCount]);
 
-  const persistSettings = useCallback(async (next) => { await storageSet(STORAGE_KEYS.SETTINGS, JSON.stringify(next)); setSettingsState(next); }, []);
+  const persistSettings = useCallback((next) => persistCollection(STORAGE_KEYS.SETTINGS, next, setSettingsState, true), [persistCollection]);
 
   const addAudit = useCallback((action, detail) => {
     const entry = { id: uid('AL'), at: new Date().toISOString(), actor: session?.username || 'system', action, detail: detail || '' };
@@ -598,10 +670,54 @@ function App() {
     ];
   }
 
-  const persistTools = useCallback(async (next) => { await storageSet(STORAGE_KEYS.TOOLS, JSON.stringify(next)); setTools(next); }, []);
-  const persistStaff = useCallback(async (next) => { await storageSet(STORAGE_KEYS.STAFF, JSON.stringify(next)); setStaff(next); }, []);
-  const persistTx = useCallback(async (next) => { await storageSet(STORAGE_KEYS.TX, JSON.stringify(next)); setTx(next); }, []);
-  const persistWarehouses = useCallback(async (next) => { await storageSet(STORAGE_KEYS.WAREHOUSES, JSON.stringify(next)); setWarehouses(next); }, []);
+  const persistTools = useCallback((next) => persistCollection(STORAGE_KEYS.TOOLS, next, setTools, true), [persistCollection]);
+  const persistStaff = useCallback((next) => persistCollection(STORAGE_KEYS.STAFF, next, setStaff, true), [persistCollection]);
+  const persistTx = useCallback((next) => persistCollection(STORAGE_KEYS.TX, next, setTx, true), [persistCollection]);
+  const persistWarehouses = useCallback((next) => persistCollection(STORAGE_KEYS.WAREHOUSES, next, setWarehouses, true), [persistCollection]);
+
+  // Replays anything saved locally while offline back to the shared backend.
+  // Stops at the first item that still fails (still offline, or backend
+  // still unreachable) and just waits for the next trigger — this function
+  // is safe to call repeatedly (on reconnect, on a timer, and on mount).
+  const flushOfflineQueue = useCallback(async () => {
+    const keys = readOfflineQueueIndex();
+    if (!keys.length) return;
+    setSyncing(true);
+    let succeeded = 0;
+    for (const key of keys) {
+      try {
+        const json = localStorage.getItem(OFFLINE_QUEUE_PREFIX + key);
+        if (json === null) { removeFromOfflineQueue(key); continue; }
+        await storageSet(key, json, true);
+        removeFromOfflineQueue(key);
+        succeeded++;
+      } catch (err) {
+        break; // still can't reach the backend — leave the rest queued, try again later
+      }
+    }
+    setPendingSyncKeys(readOfflineQueueIndex());
+    setSyncing(false);
+    if (succeeded > 0) showToast(`ซิงค์ข้อมูลที่บันทึกไว้ตอนออฟไลน์ขึ้นฐานข้อมูลกลางสำเร็จ (${succeeded} รายการ)`, 'success');
+  }, []);
+
+  useEffect(() => {
+    function goOnline() { setIsOnline(true); flushOfflineQueue(); }
+    function goOffline() { setIsOnline(false); }
+    window.addEventListener('online', goOnline);
+    window.addEventListener('offline', goOffline);
+    // 'online'/'offline' events are unreliable on some mobile browsers, so
+    // also poll periodically — this is what actually guarantees a queued
+    // change never gets stuck forever.
+    const interval = setInterval(() => {
+      if (typeof navigator === 'undefined' || navigator.onLine !== false) flushOfflineQueue();
+    }, 20000);
+    if (typeof navigator === 'undefined' || navigator.onLine !== false) flushOfflineQueue();
+    return () => {
+      window.removeEventListener('online', goOnline);
+      window.removeEventListener('offline', goOffline);
+      clearInterval(interval);
+    };
+  }, [flushOfflineQueue]);
 
   // Live updates: the storage shim (when backed by a real shared database, e.g.
   // Supabase Realtime) dispatches this event whenever ANY device changes shared
@@ -690,15 +806,23 @@ function App() {
     };
     // Condition photos are stored under their own key (not inside the tx list itself)
     // so the shared record list stays small — the photo is never read back into the UI.
+    // Photos aren't part of the offline queue (they're too large for a local
+    // fallback), so if the network is down, skip the photo rather than
+    // blocking the whole borrow — the crib still needs to keep moving.
+    let photoOk = true;
+    if (photoDataUrl) {
+      try { await storageSet(`toolcrib-photo:${record.id}:borrow`, photoDataUrl); }
+      catch (err) { console.error('failed to save borrow photo', err); photoOk = false; record.hasBorrowPhoto = false; }
+    }
     try {
-      if (photoDataUrl) await storageSet(`toolcrib-photo:${record.id}:borrow`, photoDataUrl);
       await persistTx([record, ...tx]);
     } catch (err) {
       console.error('failed to save borrow', err);
-      return showToast('บันทึกการยืมไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่', 'error');
+      return showToast('บันทึกการยืมไม่สำเร็จ กรุณาลองใหม่', 'error');
     }
     addAudit('borrow', `${st.name} ยืม ${tool.code} — ${tool.name}`);
-    showToast(`บันทึกการยืม "${tool.name}" โดย ${st.name} เรียบร้อย`, 'success');
+    if (photoDataUrl && !photoOk) showToast(`บันทึกการยืม "${tool.name}" สำเร็จ แต่รูปหลักฐานอัปโหลดไม่สำเร็จ (ออฟไลน์) กรุณาถ่ายใหม่ตอนกลับมาออนไลน์`, 'warning');
+    else showToast(`บันทึกการยืม "${tool.name}" โดย ${st.name} เรียบร้อย`, 'success');
   }
 
   async function handleReturn(toolId, returnedByStaffId, photoDataUrl) {
@@ -706,17 +830,22 @@ function App() {
     if (!tool) return showToast('ไม่พบรหัสเครื่องมือนี้ในระบบ', 'error');
     const open = activeByTool.get(tool.id);
     if (!open) return showToast(`${tool.name} ไม่มีรายการค้างยืมอยู่`, 'error');
-    const next = tx.map(t => t.id === open.id ? { ...t, returnDate: new Date().toISOString(), returnedBy: returnedByStaffId || null, hasReturnPhoto: !!photoDataUrl } : t);
+    let photoOk = true;
+    if (photoDataUrl) {
+      try { await storageSet(`toolcrib-photo:${open.id}:return`, photoDataUrl); }
+      catch (err) { console.error('failed to save return photo', err); photoOk = false; }
+    }
+    const next = tx.map(t => t.id === open.id ? { ...t, returnDate: new Date().toISOString(), returnedBy: returnedByStaffId || null, hasReturnPhoto: !!photoDataUrl && photoOk } : t);
     try {
-      if (photoDataUrl) await storageSet(`toolcrib-photo:${open.id}:return`, photoDataUrl);
       await persistTx(next);
     } catch (err) {
       console.error('failed to save return', err);
-      return showToast('บันทึกการคืนไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่', 'error');
+      return showToast('บันทึกการคืนไม่สำเร็จ กรุณาลองใหม่', 'error');
     }
     const byStaff = returnedByStaffId ? staff.find(s => s.id === returnedByStaffId) : null;
     addAudit('return', `${byStaff ? byStaff.name : 'ไม่ระบุ'} คืน ${tool.code} — ${tool.name}`);
-    showToast(`บันทึกการคืน "${tool.name}" เรียบร้อย`, 'success');
+    if (photoDataUrl && !photoOk) showToast(`บันทึกการคืน "${tool.name}" สำเร็จ แต่รูปหลักฐานอัปโหลดไม่สำเร็จ (ออฟไลน์)`, 'warning');
+    else showToast(`บันทึกการคืน "${tool.name}" เรียบร้อย`, 'success');
   }
 
   // Admin override: directly fix a transaction's due date, or force it
@@ -866,6 +995,7 @@ function App() {
         <header className="topbar">
           <h1>{NAV.find(n => n.id === page)?.label}</h1>
           <div className="topbar-right">
+            <ConnectionStatusPill isOnline={isOnline} pendingCount={pendingSyncKeys.length} syncing={syncing} />
             <NotificationBell overdueList={overdueList} onGoScan={() => setPage('scan')} />
             <div className="admin-pill"><UserCircle2 size={18} /> {session.username} · {isAdmin ? 'แอดมิน' : 'พนักงาน'}</div>
           </div>
@@ -877,7 +1007,8 @@ function App() {
           <>
             {page === 'dashboard' && (
               <Dashboard kpis={kpis} tools={tools} staff={staff} tx={tx} toolStatus={toolStatus}
-                overdueList={overdueList} isAdmin={isAdmin} onViewPhoto={viewEvidencePhoto} onEditTx={handleEditTx} />
+                overdueList={overdueList} isAdmin={isAdmin} onViewPhoto={viewEvidencePhoto} onEditTx={handleEditTx}
+                settings={settings} onGoSettings={() => setPage('settings')} />
             )}
             {page === 'scan' && (
               <ScanPage tools={tools} staff={staff} tx={tx} toolStatus={toolStatus} settings={settings}
@@ -1132,6 +1263,24 @@ function ChangePasswordModal({ onChange, onClose, showToast }) {
 }
 
 /* ---------------------------- Notification Bell ---------------------------- */
+function ConnectionStatusPill({ isOnline, pendingCount, syncing }) {
+  if (isOnline && !pendingCount && !syncing) {
+    return <div className="conn-pill conn-ok" title="เชื่อมต่อฐานข้อมูลกลางอยู่"><Wifi size={13} /></div>;
+  }
+  if (!isOnline) {
+    return (
+      <div className="conn-pill conn-offline" title="ไม่มีอินเทอร์เน็ต — ยังใช้งานได้ตามปกติ ข้อมูลจะบันทึกไว้ในเครื่องนี้ก่อนแล้วซิงค์อัตโนมัติเมื่อกลับมาออนไลน์">
+        <WifiOff size={13} /> ออฟไลน์{pendingCount > 0 ? ` · รอซิงค์ ${pendingCount}` : ''}
+      </div>
+    );
+  }
+  return (
+    <div className="conn-pill conn-syncing" title="กำลังซิงค์ข้อมูลที่ค้างไว้ขึ้นฐานข้อมูลกลาง">
+      <Loader2 size={13} className="spin" /> กำลังซิงค์{pendingCount > 0 ? ` (${pendingCount})` : ''}
+    </div>
+  );
+}
+
 function NotificationBell({ overdueList, onGoScan }) {
   const [open, setOpen] = useState(false);
   const count = overdueList?.length || 0;
@@ -1223,45 +1372,87 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
   const [staffImportBusy, setStaffImportBusy] = useState(false);
   const staffFileInputRef = React.useRef(null);
   const [newAccounts, setNewAccounts] = useState(null); // temp-password results shown once after staff import
+  const [backupBusy, setBackupBusy] = useState(false);
   useEffect(() => { setForm(settings); }, [settings]);
 
   async function save(e) {
     e.preventDefault();
     const maxBorrow = Number(form.maxBorrowPerStaff);
     const dueDays = Number(form.defaultDueDays);
+    const reminderDays = Number(form.backupReminderDays) || 7;
     if (!maxBorrow || maxBorrow < 1) return showToast('จำนวนเครื่องมือสูงสุดต้องอย่างน้อย 1 ชิ้น', 'error');
     if (!dueDays || dueDays < 1) return showToast('จำนวนวันกำหนดคืนต้องอย่างน้อย 1 วัน', 'error');
-    const next = { maxBorrowPerStaff: maxBorrow, defaultDueDays: dueDays };
+    const next = { ...settings, maxBorrowPerStaff: maxBorrow, defaultDueDays: dueDays, backupReminderDays: reminderDays };
     try {
       await setSettings(next);
     } catch (err) {
       console.error('failed to save settings', err);
       return showToast('บันทึกไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่', 'error');
     }
-    addAudit?.('settings_update', `จำนวนยืมสูงสุดต่อคน: ${maxBorrow}, กำหนดคืนเริ่มต้น: ${dueDays} วัน`);
+    addAudit?.('settings_update', `จำนวนยืมสูงสุดต่อคน: ${maxBorrow}, กำหนดคืนเริ่มต้น: ${dueDays} วัน, เตือนสำรองข้อมูลทุก: ${reminderDays} วัน`);
     showToast('บันทึกการตั้งค่าเรียบร้อย', 'success');
   }
 
-  function doFullBackup() {
-    const wb = XLSX.utils.book_new();
-    wb.SheetNames.push('รายการเครื่องมือ');
-    wb.Sheets['รายการเครื่องมือ'] = XLSX.utils.json_to_sheet(buildToolReportRows(tools, warehouses, toolStatus));
-    wb.SheetNames.push('คลังเครื่องมือ');
-    wb.Sheets['คลังเครื่องมือ'] = XLSX.utils.json_to_sheet(warehouses.map(w => ({ ชื่อคลัง: w.name, หมายเหตุ: w.note || '' })));
-    wb.SheetNames.push('พนักงาน');
-    wb.Sheets['พนักงาน'] = XLSX.utils.json_to_sheet(staff.map(s => ({ รหัสพนักงาน: s.code, 'ชื่อ-สกุล': s.name, สังกัด: s.dept })));
-    wb.SheetNames.push('ประวัติยืม-คืน');
-    wb.Sheets['ประวัติยืม-คืน'] = XLSX.utils.json_to_sheet(tx.map(t => {
-      const tool = tools.find(x => x.id === t.toolId); const st = staff.find(x => x.id === t.staffId);
-      return {
-        รหัสเครื่องมือ: tool?.code || '-', ผู้ยืม: st?.name || '-',
-        'วันเวลาที่ยืม': fmtThaiDateTime(t.borrowDate), กำหนดคืน: fmtThaiDate(t.dueDate),
-        'วันเวลาที่คืน': t.returnDate ? fmtThaiDateTime(t.returnDate) : 'ยังไม่คืน'
-      };
-    }));
-    XLSX.writeFile(wb, `สำรองข้อมูลระบบ-${todayISO()}.xlsx`);
-    addAudit?.('data_backup', `สำรองข้อมูลทั้งหมด (${tools.length} เครื่องมือ, ${staff.length} พนักงาน, ${tx.length} ประวัติ)`);
-    showToast('สำรองข้อมูลเป็น Excel เรียบร้อย', 'success');
+  async function doFullBackup() {
+    setBackupBusy(true);
+    try {
+      const wb = XLSX.utils.book_new();
+      wb.SheetNames.push('รายการเครื่องมือ');
+      wb.Sheets['รายการเครื่องมือ'] = XLSX.utils.json_to_sheet(buildToolReportRows(tools, warehouses, toolStatus));
+      wb.SheetNames.push('คลังเครื่องมือ');
+      wb.Sheets['คลังเครื่องมือ'] = XLSX.utils.json_to_sheet(warehouses.map(w => ({ ชื่อคลัง: w.name, หมายเหตุ: w.note || '' })));
+      wb.SheetNames.push('พนักงาน');
+      wb.Sheets['พนักงาน'] = XLSX.utils.json_to_sheet(staff.map(s => ({ รหัสพนักงาน: s.code, 'ชื่อ-สกุล': s.name, สังกัด: s.dept })));
+      wb.SheetNames.push('ประวัติยืม-คืน');
+      wb.Sheets['ประวัติยืม-คืน'] = XLSX.utils.json_to_sheet(tx.map(t => {
+        const tool = tools.find(x => x.id === t.toolId); const st = staff.find(x => x.id === t.staffId);
+        return {
+          รหัสเครื่องมือ: tool?.code || '-', ผู้ยืม: st?.name || '-',
+          'วันเวลาที่ยืม': fmtThaiDateTime(t.borrowDate), กำหนดคืน: fmtThaiDate(t.dueDate),
+          'วันเวลาที่คืน': t.returnDate ? fmtThaiDateTime(t.returnDate) : 'ยังไม่คืน'
+        };
+      }));
+      const xlsxArrayBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+
+      await ensureJsZip();
+      const zip = new window.JSZip();
+      zip.file(`ข้อมูลระบบ-${todayISO()}.xlsx`, xlsxArrayBuffer);
+
+      // Bundle evidence photos into the same archive so "สำรองข้อมูล" really
+      // covers everything (staff, tools, history, and photos) in one file.
+      let photoCount = 0;
+      try {
+        const list = await window.storage.list('toolcrib-photo:', true);
+        for (const key of (list?.keys || [])) {
+          const raw = await storageGet(key, true);
+          if (!raw) continue;
+          const match = /^data:image\/(\w+);base64,(.*)$/.exec(raw);
+          if (!match) continue;
+          const ext = match[1] === 'jpeg' ? 'jpg' : match[1];
+          const safeName = key.replace(/^toolcrib-photo:/, '').replace(/:/g, '_');
+          zip.file(`รูปหลักฐาน/${safeName}.${ext}`, match[2], { base64: true });
+          photoCount++;
+        }
+      } catch (err) { console.error('failed to bundle photos into backup', err); }
+
+      const blob = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `สำรองข้อมูลระบบ-${todayISO()}.zip`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+
+      const now = new Date().toISOString();
+      try { await setSettings({ ...settings, lastBackupAt: now }); } catch (err) { /* the backup file already downloaded either way */ }
+
+      addAudit?.('data_backup', `สำรองข้อมูลทั้งหมด (${tools.length} เครื่องมือ, ${staff.length} พนักงาน, ${tx.length} ประวัติ, ${photoCount} รูปภาพ)`);
+      showToast(`สำรองข้อมูลเรียบร้อย (รวมรูปหลักฐาน ${photoCount} รูป)`, 'success');
+    } catch (err) {
+      console.error('backup failed', err);
+      showToast('สำรองข้อมูลไม่สำเร็จ กรุณาลองใหม่', 'error');
+    } finally {
+      setBackupBusy(false);
+    }
   }
 
   async function handleFile(e) {
@@ -1406,6 +1597,11 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
             <label>จำนวนวันกำหนดคืนเริ่มต้น (วัน)</label>
             <input type="number" min={1} value={form.defaultDueDays} onChange={e => setForm({ ...form, defaultDueDays: e.target.value })} />
           </div>
+          <div className="form-group">
+            <label>เตือนให้สำรองข้อมูลทุกๆ (วัน)</label>
+            <input type="number" min={1} value={form.backupReminderDays ?? 7} onChange={e => setForm({ ...form, backupReminderDays: e.target.value })} />
+            {settings.lastBackupAt && <div className="muted" style={{ fontSize: 12, marginTop: 4 }}>สำรองข้อมูลล่าสุด: {fmtThaiDateTime(settings.lastBackupAt)}</div>}
+          </div>
           <div className="form-actions">
             <button type="submit" className="btn btn-primary">บันทึกการตั้งค่า</button>
           </div>
@@ -1421,9 +1617,11 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
         <div className="data-mgmt-block">
           <div>
             <div className="data-mgmt-title">สำรองข้อมูลทั้งหมด</div>
-            <div className="muted" style={{ fontSize: 12 }}>ดาวน์โหลดเครื่องมือ, คลัง, พนักงาน และประวัติยืม-คืนทั้งหมด เป็นไฟล์ Excel ชุดเดียว</div>
+            <div className="muted" style={{ fontSize: 12 }}>ดาวน์โหลดเครื่องมือ, คลัง, พนักงาน, ประวัติยืม-คืน และรูปหลักฐานทั้งหมด เป็นไฟล์ ZIP ชุดเดียว</div>
           </div>
-          <button className="btn btn-secondary" onClick={doFullBackup}><Download size={14} /> สำรองข้อมูล (Excel)</button>
+          <button className="btn btn-secondary" onClick={doFullBackup} disabled={backupBusy}>
+            {backupBusy ? <Loader2 size={14} className="spin" /> : <Download size={14} />} {backupBusy ? 'กำลังสำรองข้อมูล…' : 'สำรองข้อมูล (ZIP)'}
+          </button>
         </div>
 
         <div className="data-mgmt-block">
@@ -1523,8 +1721,23 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
 }
 
 /* ---------------------------- Dashboard ---------------------------- */
-function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, onViewPhoto, onEditTx }) {
+function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, onViewPhoto, onEditTx, settings, onGoSettings }) {
   const recent = [...tx].sort((a, b) => (b.borrowDate + (b.returnDate || '9')).localeCompare(a.borrowDate + (a.returnDate || '9'))).slice(0, 6);
+
+  const [snoozed, setSnoozed] = useState(() => {
+    try { return localStorage.getItem('tai_lbc_backup_snooze_date') === todayISO(); } catch (e) { return false; }
+  });
+  const backupDue = useMemo(() => {
+    if (!isAdmin || !settings) return false;
+    const reminderDays = Number(settings.backupReminderDays) || 7;
+    if (!settings.lastBackupAt) return true; // never backed up yet
+    const daysSince = (Date.now() - new Date(settings.lastBackupAt).getTime()) / 86400000;
+    return daysSince >= reminderDays;
+  }, [isAdmin, settings]);
+  function snoozeBackupReminder() {
+    try { localStorage.setItem('tai_lbc_backup_snooze_date', todayISO()); } catch (e) {}
+    setSnoozed(true);
+  }
 
   const topTools = useMemo(() => {
     const counts = new Map();
@@ -1551,6 +1764,28 @@ function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, o
 
   return (
     <div className="page-stack">
+      {backupDue && !snoozed && (
+        <section className="panel backup-reminder-panel">
+          <div className="backup-reminder-text">
+            <ShieldAlert size={18} />
+            <div>
+              <div className="backup-reminder-title">
+                {settings?.lastBackupAt ? 'ถึงเวลาสำรองข้อมูลแล้ว' : 'ยังไม่เคยสำรองข้อมูลระบบนี้เลย'}
+              </div>
+              <div className="muted" style={{ fontSize: 12.5 }}>
+                {settings?.lastBackupAt
+                  ? `สำรองข้อมูลล่าสุดเมื่อ ${fmtThaiDateTime(settings.lastBackupAt)} — แนะนำให้สำรองเป็นระยะเพื่อกันข้อมูลสูญหาย`
+                  : 'แนะนำให้สำรองข้อมูล (เครื่องมือ, พนักงาน, ประวัติยืม-คืน, รูปหลักฐาน) เก็บไว้ในเครื่องส่วนตัวสักครั้ง'}
+              </div>
+            </div>
+          </div>
+          <div className="backup-reminder-actions">
+            <button className="btn btn-secondary" onClick={snoozeBackupReminder}>เตือนพรุ่งนี้</button>
+            <button className="btn btn-primary" onClick={onGoSettings}><Download size={14} /> ไปสำรองข้อมูล</button>
+          </div>
+        </section>
+      )}
+
       <section className="kpi-grid">
         <KpiCard label="ครุภัณฑ์ทั้งหมด" value={kpis.total} icon={Package} tone="steel" />
         <KpiCard label="พร้อมใช้งาน" value={kpis.available} icon={CheckCircle2} tone="teal" />
@@ -2991,6 +3226,10 @@ const CSS = `
   .topbar{ display:flex; align-items:center; justify-content:space-between; margin-bottom:22px; }
   .topbar h1{ font-size:22px; font-weight:600; color:var(--ink); }
   .admin-pill{ display:flex; align-items:center; gap:8px; background:var(--card); border:1px solid var(--line); padding:7px 14px; border-radius:30px; font-size:13px; font-weight:600; box-shadow:var(--shadow-sm); color:var(--ink); }
+  .conn-pill{ display:flex; align-items:center; gap:6px; padding:7px 12px; border-radius:30px; font-size:12px; font-weight:700; }
+  .conn-pill.conn-ok{ background:var(--teal-tint); color:var(--teal-deep); }
+  .conn-pill.conn-offline{ background:var(--amber-tint); color:#8A5A15; }
+  .conn-pill.conn-syncing{ background:var(--purple-tint); color:var(--purple); }
   .loading-state{ display:flex; align-items:center; gap:10px; color:var(--ink-soft); padding:60px 0; justify-content:center; }
   .spin{ animation:spin 1s linear infinite; }
   @keyframes spin{ to{ transform:rotate(360deg); } }
@@ -3190,6 +3429,11 @@ const CSS = `
 
   /* Overdue panel */
   .overdue-panel{ border-color:rgba(242,99,74,0.25); background:linear-gradient(180deg, var(--danger-tint), var(--card)); }
+  .backup-reminder-panel{ display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; border-color:rgba(245,171,76,0.35); background:linear-gradient(180deg, var(--amber-tint), var(--card)); padding:16px 20px; }
+  .backup-reminder-text{ display:flex; align-items:flex-start; gap:10px; color:var(--amber); }
+  .backup-reminder-text > div:last-child{ color:var(--ink); }
+  .backup-reminder-title{ font-weight:700; font-size:14px; }
+  .backup-reminder-actions{ display:flex; gap:8px; flex-shrink:0; }
   .overdue-chip-list{ display:flex; flex-wrap:wrap; gap:8px; }
   .overdue-chip{ display:flex; align-items:center; gap:8px; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:8px 12px; font-size:12.5px; }
   .overdue-chip-name{ max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -3271,6 +3515,7 @@ const CSS = `
   }
   .toast.success{ background:var(--teal); color:#fff; }
   .toast.error{ background:var(--danger); color:#fff; }
+  .toast.warning{ background:var(--amber); color:#fff; }
   @keyframes toastIn{ from{ opacity:0; transform:translate(-50%,10px); } to{ opacity:1; transform:translate(-50%,0); } }
 
   @media (max-width: 860px){
