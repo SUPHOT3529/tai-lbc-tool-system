@@ -533,7 +533,7 @@ function App() {
         // storageGetStrict comment: a failed read must never look like "no users yet".
         if (!usersData || !usersData.length) {
           const adminHash = await hashPassword('1234');
-          usersData = [{ id: uid('U'), username: 'Admin', passwordHash: adminHash, role: 'admin', staffId: null }];
+          usersData = [{ id: uid('U'), username: 'Admin', passwordHash: adminHash, role: 'admin', staffId: null, signature: 'Admin' }];
           await storageSet(STORAGE_KEYS.USERS, JSON.stringify(usersData), true);
         }
         setUsers(usersData);
@@ -643,6 +643,22 @@ function App() {
       await persistUsers(users.map(u => u.id === match.id ? { ...u, passwordHash: newHash } : u));
     } catch (err) {
       console.error('failed to change password', err);
+      return { ok: false, error: 'บันทึกไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่' };
+    }
+    return { ok: true };
+  }
+
+  // The signature saved here is what auto-fills "Issue by (Tool Room)" on the
+  // LBC-FM-034 form whenever THIS logged-in account is the one operating the
+  // scan station — separate from the password change flow since it isn't a
+  // security-sensitive field and doesn't need the current-password check.
+  async function updateOwnSignature(signature) {
+    const match = users.find(u => u.username === session?.username);
+    if (!match) return { ok: false, error: 'ไม่พบบัญชีผู้ใช้งาน' };
+    try {
+      await persistUsers(users.map(u => u.id === match.id ? { ...u, signature: signature.trim() } : u));
+    } catch (err) {
+      console.error('failed to update signature', err);
       return { ok: false, error: 'บันทึกไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่' };
     }
     return { ok: true };
@@ -872,9 +888,32 @@ function App() {
     return open.dueDate < todayISO() ? 'overdue' : 'borrowed';
   }
 
+  // The seeded "Admin" account (username hardcoded at signup, never renamable
+  // through the UI) is the ONE account that can create other admins and set
+  // their warehouse scope — every other admin is a "secondary admin" that the
+  // main admin explicitly grants access to.
+  const currentUserRecord = users.find(u => u.username === session?.username) || null;
+  const isMainAdmin = session?.username === 'Admin';
+  // undefined/missing warehouseScope means unrestricted (matches every admin's
+  // behavior before this feature existed, and is always true for the main
+  // admin) — only an explicit array actually restricts what a secondary admin
+  // can see/manage. NOTE: deliberately NOT pre-filtering `tools`/`warehouses`
+  // here — pages like ToolsPage/WarehousePage rebuild their full collection
+  // from their `tools`/`warehouses` prop before every save (e.g.
+  // `tools.map(...)` then `setTools(...)`), so handing them a pre-filtered
+  // subset would silently delete every tool/warehouse outside scope on the
+  // next edit. Instead every consumer gets the FULL collections plus this id
+  // list, and filters for DISPLAY only.
+  const scopedWarehouseIds = (isMainAdmin || session?.role !== 'admin' || !currentUserRecord?.warehouseScope) ? null : currentUserRecord.warehouseScope;
+
+  // Scoped so a restricted secondary admin's dashboard reflects only the
+  // warehouse(s) they actually manage, rather than showing org-wide totals
+  // that don't match what they can act on below.
+  const scopedWarehouseIdSetForKpis = scopedWarehouseIds ? new Set(scopedWarehouseIds) : null;
+  const kpiTools = scopedWarehouseIdSetForKpis ? tools.filter(t => scopedWarehouseIdSetForKpis.has(t.warehouseId)) : tools;
   const kpis = useMemo(() => {
     let available = 0, borrowed = 0, overdue = 0, damaged = 0, calibration = 0;
-    for (const t of tools) {
+    for (const t of kpiTools) {
       const s = toolStatus(t.id);
       if (s === 'available') available++;
       else if (s === 'overdue') overdue++;
@@ -882,8 +921,8 @@ function App() {
       else if (s === 'calibration') calibration++;
       else borrowed++;
     }
-    return { total: tools.length, available, borrowed, overdue, damaged, calibration };
-  }, [tools, activeByTool]);
+    return { total: kpiTools.length, available, borrowed, overdue, damaged, calibration };
+  }, [kpiTools, activeByTool]);
 
   const overdueList = useMemo(() => {
     const list = [];
@@ -1126,6 +1165,7 @@ function App() {
           <>
             {page === 'dashboard' && (
               <Dashboard kpis={kpis} tools={tools} staff={staff} tx={tx} toolStatus={toolStatus} warehouses={warehouses}
+                scopedWarehouseIds={scopedWarehouseIds}
                 shelves={shelves} setShelves={persistShelves} setTools={persistTools} addAudit={addAudit} showToast={showToast}
                 overdueList={overdueList} isAdmin={isAdmin} onViewPhoto={viewEvidencePhoto} onEditTx={handleEditTx}
                 settings={settings} onGoSettings={() => setPage('settings')} />
@@ -1133,20 +1173,20 @@ function App() {
             {page === 'scan' && (
               <ScanPage tools={tools} staff={staff} tx={tx} toolStatus={toolStatus} settings={settings} warehouses={warehouses}
                 onBorrow={handleBorrow} onReturn={handleReturn} activeByTool={activeByTool} showToast={showToast}
-                isAdmin={isAdmin} onEditTx={handleEditTx} />
+                isAdmin={isAdmin} onEditTx={handleEditTx} issuerSignature={currentUserRecord?.signature || ''} />
             )}
             {page === 'tools' && isAdmin && (
               <ToolsPage tools={tools} setTools={persistTools} toolStatus={toolStatus} showToast={showToast}
                 onSetCondition={setToolCondition} onSetCalibration={setToolCalibration}
-                addAudit={addAudit} warehouses={warehouses} tx={tx} staff={staff} />
+                addAudit={addAudit} warehouses={warehouses} scopedWarehouseIds={scopedWarehouseIds} tx={tx} staff={staff} />
             )}
             {page === 'warehouse' && isAdmin && (
               <WarehousePage warehouses={warehouses} setWarehouses={persistWarehouses} tools={tools} toolStatus={toolStatus}
-                showToast={showToast} addAudit={addAudit} />
+                showToast={showToast} addAudit={addAudit} isMainAdmin={isMainAdmin} scopedWarehouseIds={scopedWarehouseIds} />
             )}
             {page === 'staff' && isAdmin && (
               <StaffPage staff={staff} setStaff={persistStaff} tx={tx} showToast={showToast}
-                users={users} setUsers={persistUsers} addAudit={addAudit} />
+                users={users} setUsers={persistUsers} addAudit={addAudit} warehouses={warehouses} isMainAdmin={isMainAdmin} />
             )}
             {page === 'audit' && isAdmin && (
               <AuditPage auditLog={auditLog} />
@@ -1171,7 +1211,8 @@ function App() {
       )}
 
       {changePwOpen && (
-        <ChangePasswordModal onChange={changeOwnPassword} onClose={() => setChangePwOpen(false)} showToast={showToast} />
+        <ChangePasswordModal onChange={changeOwnPassword} onClose={() => setChangePwOpen(false)} showToast={showToast}
+          currentSignature={currentUserRecord?.signature || ''} onChangeSignature={updateOwnSignature} />
       )}
     </div>
   );
@@ -1332,12 +1373,14 @@ function ForgotPasswordModal({ onResetPassword, onClose }) {
   );
 }
 
-function ChangePasswordModal({ onChange, onClose, showToast }) {
+function ChangePasswordModal({ onChange, onClose, showToast, currentSignature, onChangeSignature }) {
   const [current, setCurrent] = useState('');
   const [next1, setNext1] = useState('');
   const [next2, setNext2] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [signature, setSignature] = useState(currentSignature || '');
+  const [sigBusy, setSigBusy] = useState(false);
 
   async function submit(e) {
     e.preventDefault();
@@ -1352,6 +1395,14 @@ function ChangePasswordModal({ onChange, onClose, showToast }) {
     onClose();
   }
 
+  async function submitSignature() {
+    setSigBusy(true);
+    const res = await onChangeSignature(signature);
+    setSigBusy(false);
+    if (!res.ok) { showToast?.(res.error || 'บันทึกลายเซ็นไม่สำเร็จ', 'error'); return; }
+    showToast?.('บันทึกลายเซ็นเรียบร้อยแล้ว', 'success');
+  }
+
   return (
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-card" onClick={e => e.stopPropagation()}>
@@ -1359,10 +1410,25 @@ function ChangePasswordModal({ onChange, onClose, showToast }) {
           <h3><KeyRound size={17} /> เปลี่ยนรหัสผ่าน</h3>
           <button className="icon-btn" onClick={onClose}><X size={18} /></button>
         </div>
+
+        {/* Independent of the password form below — this is what auto-fills
+            "Issue by (Tool Room)" on the LBC-FM-034 form whenever this account
+            is the one running the scan station. */}
+        <div className="form-group">
+          <label>ลายเซ็นของฉัน (สำหรับใบยืม-คืน LBC-FM-034)</label>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input value={signature} onChange={e => setSignature(e.target.value)} placeholder="เช่น Admin" style={{ flex: 1 }} />
+            <button type="button" className="btn btn-secondary" disabled={sigBusy} onClick={submitSignature}>
+              {sigBusy ? <Loader2 className="spin" size={15} /> : 'บันทึก'}
+            </button>
+          </div>
+        </div>
+        <div style={{ borderTop: '1px solid var(--line)', margin: '4px 0 14px' }} />
+
         <form onSubmit={submit} className="modal-form">
           <div className="form-group">
             <label>รหัสผ่านปัจจุบัน</label>
-            <input type="password" autoFocus value={current} onChange={e => setCurrent(e.target.value)} />
+            <input type="password" value={current} onChange={e => setCurrent(e.target.value)} />
           </div>
           <div className="form-group">
             <label>รหัสผ่านใหม่</label>
@@ -1895,7 +1961,7 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
 }
 
 /* ---------------------------- Dashboard ---------------------------- */
-function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, onViewPhoto, onEditTx, settings, onGoSettings, warehouses, shelves, setShelves, setTools, addAudit, showToast }) {
+function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, onViewPhoto, onEditTx, settings, onGoSettings, warehouses, scopedWarehouseIds, shelves, setShelves, setTools, addAudit, showToast }) {
   const recent = [...tx].sort((a, b) => (b.borrowDate + (b.returnDate || '9')).localeCompare(a.borrowDate + (a.returnDate || '9'))).slice(0, 6);
 
   const [snoozed, setSnoozed] = useState(() => {
@@ -2076,7 +2142,7 @@ function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, o
         </section>
       )}
 
-      <WarehouseShadowBoard tools={tools} warehouses={warehouses} shelves={shelves} setShelves={setShelves}
+      <WarehouseShadowBoard tools={tools} warehouses={warehouses} scopedWarehouseIds={scopedWarehouseIds} shelves={shelves} setShelves={setShelves}
         setTools={setTools} toolStatus={toolStatus} isAdmin={isAdmin} showToast={showToast} addAudit={addAudit} />
 
       <section className="panel">
@@ -2097,11 +2163,16 @@ function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, o
 // a real shadow-board panel.
 const SHELF_CAPACITY = 100;
 
-function WarehouseShadowBoard({ tools, warehouses, shelves, setShelves, setTools, toolStatus, isAdmin, showToast, addAudit }) {
-  const [activeWh, setActiveWh] = useState(warehouses[0]?.id || null);
+function WarehouseShadowBoard({ tools, warehouses, scopedWarehouseIds, shelves, setShelves, setTools, toolStatus, isAdmin, showToast, addAudit }) {
+  // Same pattern as ToolsPage/WarehousePage: `tools`/`warehouses` stay whole
+  // (safe for shelf-assign/unassign saves, which rebuild from the full array),
+  // only the tab list and the initially-selected warehouse are narrowed for a
+  // restricted secondary admin.
+  const visibleWarehouses = scopedWarehouseIds ? warehouses.filter(w => scopedWarehouseIds.includes(w.id)) : warehouses;
+  const [activeWh, setActiveWh] = useState(visibleWarehouses[0]?.id || null);
   useEffect(() => {
-    if ((!activeWh || !warehouses.some(w => w.id === activeWh)) && warehouses.length) setActiveWh(warehouses[0].id);
-  }, [warehouses, activeWh]);
+    if ((!activeWh || !visibleWarehouses.some(w => w.id === activeWh)) && visibleWarehouses.length) setActiveWh(visibleWarehouses[0].id);
+  }, [visibleWarehouses, activeWh]);
 
   const [pickerShelf, setPickerShelf] = useState(null);
   // Which tool's QR popover is currently open (one at a time, toggled by
@@ -2257,9 +2328,9 @@ function WarehouseShadowBoard({ tools, warehouses, shelves, setShelves, setTools
         <p>เหมือนบอร์ดแขวนเครื่องมือจริงในแต่ละคลัง: ช่องว่างที่เห็นได้ทันทีคือเครื่องมือที่ไม่อยู่บนชั้น — เลือกคลังเพื่อดูผังของคลังนั้น</p>
       </div>
 
-      {warehouses.length > 1 && (
+      {visibleWarehouses.length > 1 && (
         <div className="wh-switch" style={{ marginBottom: 14 }}>
-          {warehouses.map(w => (
+          {visibleWarehouses.map(w => (
             <button key={w.id} type="button" className={`wh-switch-item ${activeWh === w.id ? 'active' : ''}`} onClick={() => setActiveWh(w.id)}>
               {w.name}
             </button>
@@ -2268,7 +2339,9 @@ function WarehouseShadowBoard({ tools, warehouses, shelves, setShelves, setTools
       )}
 
       {!activeWarehouse ? (
-        <div className="empty-state">ยังไม่มีคลังเครื่องมือในระบบ</div>
+        <div className="empty-state">
+          {visibleWarehouses.length ? 'ยังไม่มีคลังเครื่องมือในระบบ' : 'คุณยังไม่ได้รับสิทธิ์ดูแลคลังใด กรุณาติดต่อแอดมินหลัก'}
+        </div>
       ) : (
         <>
           {isAdmin && (
@@ -2933,7 +3006,7 @@ function EvidencePhotoModal({ txId, kind, label, onFetch, onClose }) {
 }
 
 /* ---------------------------- Scan Page ---------------------------- */
-function ScanPage({ tools, staff, tx, toolStatus, onBorrow, onReturn, activeByTool, showToast, settings, isAdmin, onEditTx, warehouses }) {
+function ScanPage({ tools, staff, tx, toolStatus, onBorrow, onReturn, activeByTool, showToast, settings, isAdmin, onEditTx, warehouses, issuerSignature }) {
   const [mode, setMode] = useState('borrow'); // 'borrow' | 'return'
   const [staffCode, setStaffCode] = useState('');
   const [toolCode, setToolCode] = useState('');
@@ -2963,6 +3036,21 @@ function ScanPage({ tools, staff, tx, toolStatus, onBorrow, onReturn, activeByTo
 
   const matchedStaff = staffCode ? resolveStaff(staffCode) : null;
   const matchedTool = toolCode ? resolveTool(toolCode) : null;
+
+  // Both signature fields are pre-filled the moment a staff badge is matched —
+  // "Loan to (Mechanic)" from that person's own saved signature (set when
+  // their account was created/edited), "Issue by (Tool Room)" from whichever
+  // admin is currently logged in and running this scan station. Either can
+  // still be edited/overridden by hand before confirming; the fill only ever
+  // applies to an EMPTY field so it never clobbers a manual edit.
+  useEffect(() => {
+    if (!matchedStaff) return;
+    setDocManual(dm => ({
+      ...dm,
+      loanToSign: dm.loanToSign || matchedStaff.signature || '',
+      issueBySign: dm.issueBySign || issuerSignature || '',
+    }));
+  }, [matchedStaff?.id, issuerSignature]);
 
   // Enforce order: clear the tool code (and any in-progress photo/confirm state)
   // whenever the staff match is lost, so a tool can never be paired until a
@@ -3203,11 +3291,11 @@ function ScanPage({ tools, staff, tx, toolStatus, onBorrow, onReturn, activeByTo
                 </div>
                 <div className="loan-doc-grid">
                   <div className="form-group">
-                    <label>Loan to (Mechanic) — ลงชื่อผู้ยืม <span className="req-star">*</span></label>
+                    <label>Loan to (Mechanic) <span className="req-star">*</span></label>
                     <input value={docManual.loanToSign} onChange={e => setDocManual({ ...docManual, loanToSign: e.target.value })} placeholder="เช่น SUPHOT.B" />
                   </div>
                   <div className="form-group">
-                    <label>Issue by (Tool Room) — ผู้จ่ายเครื่องมือ</label>
+                    <label>Issue by (Tool Room)</label>
                     <input value={docManual.issueBySign} onChange={e => setDocManual({ ...docManual, issueBySign: e.target.value })} placeholder="เช่น SAWITEE.K" />
                   </div>
                 </div>
@@ -3224,11 +3312,11 @@ function ScanPage({ tools, staff, tx, toolStatus, onBorrow, onReturn, activeByTo
               <div className="loan-doc-block" style={{ marginTop: 0, paddingTop: 0, borderTop: 'none' }}>
                 <div className="loan-doc-title"><FileSpreadsheet size={14} /> ใบยืม-คืนเครื่องมือ (LBC-FM-034)</div>
                 <div className="form-group">
-                  <label>Return by (Mechanic) — ลงชื่อผู้คืน <span className="req-star">*</span></label>
+                  <label>Return by (Mechanic) <span className="req-star">*</span></label>
                   <input value={returnSign.returnBySign} onChange={e => setReturnSign({ ...returnSign, returnBySign: e.target.value })} placeholder="เช่น SUPHOT.B" />
                 </div>
                 <div className="form-group">
-                  <label>Receive by (Tool Room) — ผู้รับคืน (ถ้าทราบ)</label>
+                  <label>Receive by (Tool Room)</label>
                   <input value={returnSign.receiveBySign} onChange={e => setReturnSign({ ...returnSign, receiveBySign: e.target.value })} />
                 </div>
               </div>
@@ -3469,7 +3557,7 @@ function PhotoCaptureModal({ onCapture, onClose }) {
 }
 
 /* ---------------------------- Tools Page ---------------------------- */
-function ToolsPage({ tools, setTools, toolStatus, showToast, onSetCondition, onSetCalibration, addAudit, warehouses, tx, staff }) {
+function ToolsPage({ tools, setTools, toolStatus, showToast, onSetCondition, onSetCalibration, addAudit, warehouses, scopedWarehouseIds, tx, staff }) {
   const [q, setQ] = useState('');
   const [cat, setCat] = useState('all');
   const [wh, setWh] = useState('all');
@@ -3480,9 +3568,17 @@ function ToolsPage({ tools, setTools, toolStatus, showToast, onSetCondition, onS
   const [calibReceiveModal, setCalibReceiveModal] = useState(null); // tool coming back from calibration
   const [pdfBusy, setPdfBusy] = useState(false);
 
+  // A restricted secondary admin only sees/manages the warehouse(s) the main
+  // admin assigned them — the underlying `tools`/`warehouses` collections stay
+  // whole (any save still rebuilds from the FULL array), only what's shown
+  // and selectable here is narrowed.
+  const visibleWarehouses = scopedWarehouseIds ? warehouses.filter(w => scopedWarehouseIds.includes(w.id)) : warehouses;
+  const inScope = (warehouseId) => !scopedWarehouseIds || scopedWarehouseIds.includes(warehouseId);
+
   const filtered = tools.filter(t =>
     (cat === 'all' || t.category === cat) &&
     (wh === 'all' || t.warehouseId === wh) &&
+    inScope(t.warehouseId) &&
     (t.name.toLowerCase().includes(q.toLowerCase()) || t.code.toLowerCase().includes(q.toLowerCase()))
   );
 
@@ -3606,7 +3702,7 @@ function ToolsPage({ tools, setTools, toolStatus, showToast, onSetCondition, onS
           </div>
           <div className="wh-switch">
             <button className={`wh-switch-item ${wh === 'all' ? 'active' : ''}`} onClick={() => setWh('all')}>ทุกคลัง</button>
-            {warehouses.map(w => (
+            {visibleWarehouses.map(w => (
               <button key={w.id} className={`wh-switch-item ${wh === w.id ? 'active' : ''}`} onClick={() => setWh(w.id)}>{w.name}</button>
             ))}
           </div>
@@ -3682,7 +3778,7 @@ function ToolsPage({ tools, setTools, toolStatus, showToast, onSetCondition, onS
 
       {modal && (
         <Modal title={modal.mode === 'add' ? 'เพิ่มเครื่องมือใหม่' : 'แก้ไขเครื่องมือ'} onClose={() => setModal(null)}>
-          <ToolForm data={modal.data} onSave={save} onCancel={() => setModal(null)} warehouses={warehouses} />
+          <ToolForm data={modal.data} onSave={save} onCancel={() => setModal(null)} warehouses={visibleWarehouses} />
         </Modal>
       )}
 
@@ -3895,15 +3991,22 @@ function DamageForm({ tool, onSave, onCancel }) {
 }
 
 /* ---------------------------- Warehouse Page ---------------------------- */
-function WarehousePage({ warehouses, setWarehouses, tools, toolStatus, showToast, addAudit }) {
+function WarehousePage({ warehouses, setWarehouses, tools, toolStatus, showToast, addAudit, isMainAdmin, scopedWarehouseIds }) {
   const [modal, setModal] = useState(null); // {mode:'add'|'edit', data}
   const [exportingId, setExportingId] = useState(null);
+
+  // Creating/deleting warehouses is a main-admin-only action (it's the thing
+  // that defines what a secondary admin's scope even refers to) — a secondary
+  // admin can still rename/annotate the warehouse(s) they were granted, but
+  // never see or touch ones outside their scope.
+  const visibleWarehouses = scopedWarehouseIds ? warehouses.filter(w => scopedWarehouseIds.includes(w.id)) : warehouses;
 
   function openAdd() { setModal({ mode: 'add', data: { name: '', note: '' } }); }
   function openEdit(w) { setModal({ mode: 'edit', data: { ...w } }); }
 
   async function save(data) {
     if (!data.name.trim()) return showToast('กรุณากรอกชื่อคลังเครื่องมือ', 'error');
+    if (modal.mode === 'add' && !isMainAdmin) return showToast('มีแต่แอดมินหลักเท่านั้นที่เพิ่มคลังใหม่ได้', 'error');
     try {
       if (modal.mode === 'add') {
         if (warehouses.some(w => w.name.toLowerCase() === data.name.toLowerCase())) return showToast('มีชื่อคลังนี้อยู่แล้ว', 'error');
@@ -3927,6 +4030,7 @@ function WarehousePage({ warehouses, setWarehouses, tools, toolStatus, showToast
   }
 
   async function remove(w) {
+    if (!isMainAdmin) return showToast('มีแต่แอดมินหลักเท่านั้นที่ลบคลังได้', 'error');
     if (tools.some(t => t.warehouseId === w.id)) return showToast('ยังมีเครื่องมืออยู่ในคลังนี้ ย้ายออกก่อนจึงจะลบได้', 'error');
     try {
       await setWarehouses(warehouses.filter(x => x.id !== w.id));
@@ -3964,11 +4068,11 @@ function WarehousePage({ warehouses, setWarehouses, tools, toolStatus, showToast
             <h2><Building2 size={16} /> คลังเครื่องมือ</h2>
             <p>กำหนดคลัง/ห้องเก็บเครื่องมือ เพื่อแยกการจัดการและส่งออกข้อมูลเป็นรายคลัง</p>
           </div>
-          <button className="btn btn-primary" onClick={openAdd}><Plus size={16} /> เพิ่มคลัง</button>
+          <button className="btn btn-primary" onClick={openAdd} disabled={!isMainAdmin} title={isMainAdmin ? '' : 'มีแต่แอดมินหลักเท่านั้นที่เพิ่ม/ลบคลังได้'}><Plus size={16} /> เพิ่มคลัง</button>
         </div>
 
         <div className="warehouse-grid">
-          {warehouses.map(w => {
+          {visibleWarehouses.map(w => {
             const list = tools.filter(t => t.warehouseId === w.id);
             const available = list.filter(t => toolStatus(t.id) === 'available').length;
             return (
@@ -3981,7 +4085,7 @@ function WarehousePage({ warehouses, setWarehouses, tools, toolStatus, showToast
                   </div>
                   <div className="row-actions">
                     <button className="icon-btn" onClick={() => openEdit(w)}><Pencil size={15} /></button>
-                    <button className="icon-btn danger" onClick={() => remove(w)}><Trash2 size={15} /></button>
+                    {isMainAdmin && <button className="icon-btn danger" onClick={() => remove(w)}><Trash2 size={15} /></button>}
                   </div>
                 </div>
                 <div className="warehouse-card-stats">
@@ -3999,7 +4103,11 @@ function WarehousePage({ warehouses, setWarehouses, tools, toolStatus, showToast
               </div>
             );
           })}
-          {!warehouses.length && <div className="empty-state">ยังไม่มีคลังเครื่องมือ กด "เพิ่มคลัง" เพื่อเริ่มต้น</div>}
+          {!visibleWarehouses.length && (
+            <div className="empty-state">
+              {isMainAdmin ? 'ยังไม่มีคลังเครื่องมือ กด "เพิ่มคลัง" เพื่อเริ่มต้น' : 'คุณยังไม่ได้รับสิทธิ์ดูแลคลังใด กรุณาติดต่อแอดมินหลัก'}
+            </div>
+          )}
         </div>
       </section>
 
@@ -4033,29 +4141,50 @@ function WarehouseForm({ data, onSave, onCancel }) {
 }
 
 /* ---------------------------- Staff Page ---------------------------- */
-function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }) {
+function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit, warehouses, isMainAdmin }) {
   const [q, setQ] = useState('');
   const [modal, setModal] = useState(null);
   const [qrStaff, setQrStaff] = useState(null);
   const filtered = staff.filter(s => s.name.toLowerCase().includes(q.toLowerCase()) || s.code.toLowerCase().includes(q.toLowerCase()));
 
-  function openAdd() { setModal({ mode: 'add', data: { code: '', name: '', dept: DEPT_OPTIONS[0], password: '', confirmPassword: '' } }); }
+  function openAdd() {
+    setModal({ mode: 'add', data: { code: '', name: '', dept: DEPT_OPTIONS[0], password: '', confirmPassword: '', signature: '', role: 'staff', warehouseScope: [] } });
+  }
   function openEdit(s) {
-    const hasAccount = users.some(u => u.staffId === s.id);
-    setModal({ mode: 'edit', data: { ...s, newPassword: '', confirmNewPassword: '', hasAccount } });
+    const linkedUser = users.find(u => u.staffId === s.id);
+    setModal({
+      mode: 'edit',
+      data: {
+        ...s, newPassword: '', confirmNewPassword: '', hasAccount: !!linkedUser,
+        signature: s.signature || '',
+        role: linkedUser?.role || 'staff',
+        warehouseScope: linkedUser?.warehouseScope || [],
+      }
+    });
   }
 
   async function save(data) {
     const codeTrimmed = data.code.trim();
     const nameTrimmed = data.name.trim();
     if (!codeTrimmed || !nameTrimmed) return showToast('กรุณากรอกรหัสและชื่อ', 'error');
+    // Defense in depth: only the main "Admin" account may ever grant the admin
+    // role or a warehouse scope, no matter what the submitted form data says —
+    // StaffForm already hides these controls from everyone else, but a
+    // non-main-admin's submission is forced back to a plain staff account here too.
+    const requestedRole = (isMainAdmin && data.role === 'admin') ? 'admin' : 'staff';
+    const requestedScope = requestedRole === 'admin' ? (data.warehouseScope || []) : undefined;
+    const signatureTrimmed = (data.signature || '').trim();
     if (modal.mode === 'add') {
       if (staff.some(s => s.code.trim().toLowerCase() === codeTrimmed.toLowerCase())) return showToast('รหัสพนักงานนี้มีอยู่แล้ว', 'error');
       if (!data.password || data.password.length < 4) return showToast('กรุณาตั้งรหัสผ่านเข้าใช้งานอย่างน้อย 4 ตัวอักษร', 'error');
       if (data.password !== data.confirmPassword) return showToast('รหัสผ่านยืนยันไม่ตรงกัน', 'error');
       // Same principle as tools: QR is tied to the stable internal id, generated once here.
-      const newStaff = { id: uid('S'), code: codeTrimmed, name: nameTrimmed, dept: data.dept };
-      const newUser = { id: uid('U'), username: newStaff.code, passwordHash: await hashPassword(data.password), role: 'staff', staffId: newStaff.id };
+      const newStaff = { id: uid('S'), code: codeTrimmed, name: nameTrimmed, dept: data.dept, signature: signatureTrimmed };
+      const newUser = {
+        id: uid('U'), username: newStaff.code, passwordHash: await hashPassword(data.password),
+        role: requestedRole, staffId: newStaff.id, signature: signatureTrimmed,
+        ...(requestedScope !== undefined ? { warehouseScope: requestedScope } : {}),
+      };
       try {
         await setStaff([newStaff, ...staff]);
         await setUsers([newUser, ...users]);
@@ -4063,8 +4192,8 @@ function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }
         console.error('failed to save new staff/account', err);
         return showToast('บันทึกไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่ (บัญชีเข้าระบบอาจยังไม่ถูกสร้าง)', 'error');
       }
-      addAudit?.('staff_add', `${newStaff.code} — ${newStaff.name}`);
-      showToast('เพิ่มผู้ใช้งาน สร้างบัญชีเข้าระบบ และสร้าง QR บัตรเรียบร้อย', 'success');
+      addAudit?.('staff_add', `${newStaff.code} — ${newStaff.name}${requestedRole === 'admin' ? ` (แอดมินเสริม — ดูแล ${requestedScope.length} คลัง)` : ''}`);
+      showToast(`เพิ่มผู้ใช้งาน สร้างบัญชีเข้าระบบ และสร้าง QR บัตรเรียบร้อย${requestedRole === 'admin' ? ' (ตั้งเป็นแอดมินเสริมแล้ว)' : ''}`, 'success');
       setModal(null);
       setQrStaff(newStaff);
       return;
@@ -4077,13 +4206,17 @@ function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }
       if (users.some(u => u.staffId !== data.id && u.username.trim().toLowerCase() === codeTrimmed.toLowerCase())) {
         return showToast('รหัสนี้ถูกใช้เป็นชื่อผู้ใช้งานของบัญชีอื่นแล้ว', 'error');
       }
-      const cleanStaff = { id: data.id, code: codeTrimmed, name: nameTrimmed, dept: data.dept };
+      const cleanStaff = { id: data.id, code: codeTrimmed, name: nameTrimmed, dept: data.dept, signature: signatureTrimmed };
       const existingUser = users.find(u => u.staffId === data.id);
       let nextUsers;
       let passwordChanged = false;
       if (existingUser) {
         // username tracks the employee code, so keep it in sync on the linked account.
-        nextUsers = users.map(u => u.staffId === data.id ? { ...u, username: cleanStaff.code } : u);
+        // Only the main admin's edit can change role/warehouseScope — for anyone
+        // else's edit these two fields are left exactly as they already were on
+        // the account, regardless of what the (hidden, for them) form fields say.
+        const roleUpdate = isMainAdmin ? { role: requestedRole, ...(requestedScope !== undefined ? { warehouseScope: requestedScope } : { warehouseScope: undefined }) } : {};
+        nextUsers = users.map(u => u.staffId === data.id ? { ...u, username: cleanStaff.code, signature: signatureTrimmed, ...roleUpdate } : u);
         if (data.newPassword) {
           if (data.newPassword.length < 4) return showToast('รหัสผ่านใหม่ต้องมีอย่างน้อย 4 ตัวอักษร', 'error');
           if (data.newPassword !== data.confirmNewPassword) return showToast('รหัสผ่านยืนยันไม่ตรงกัน', 'error');
@@ -4099,7 +4232,10 @@ function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }
         }
         if (data.newPassword !== data.confirmNewPassword) return showToast('รหัสผ่านยืนยันไม่ตรงกัน', 'error');
         const newHash = await hashPassword(data.newPassword);
-        nextUsers = [...users, { id: uid('U'), username: cleanStaff.code, passwordHash: newHash, role: 'staff', staffId: cleanStaff.id }];
+        nextUsers = [...users, {
+          id: uid('U'), username: cleanStaff.code, passwordHash: newHash, role: requestedRole, staffId: cleanStaff.id,
+          signature: signatureTrimmed, ...(requestedScope !== undefined ? { warehouseScope: requestedScope } : {}),
+        }];
         passwordChanged = true;
       }
       try {
@@ -4116,6 +4252,10 @@ function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }
   }
 
   async function remove(s) {
+    const linkedUser = users.find(u => u.staffId === s.id);
+    if (linkedUser?.role === 'admin' && !isMainAdmin) {
+      return showToast('มีแต่แอดมินหลักเท่านั้นที่ลบบัญชีแอดมินได้', 'error');
+    }
     if (tx.some(t => t.staffId === s.id && !t.returnDate)) return showToast('ไม่สามารถลบผู้ใช้งานที่มีเครื่องมือค้างคืนได้', 'error');
     try {
       await setStaff(staff.filter(x => x.id !== s.id));
@@ -4140,16 +4280,24 @@ function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }
         </div>
         <div className="table-wrap">
           <table>
-            <thead><tr><th>รหัสพนักงาน</th><th>ชื่อ-สกุล</th><th>สังกัด</th><th>เครื่องมือค้างคืน</th><th>บัญชีเข้าระบบ</th><th></th></tr></thead>
+            <thead><tr><th>รหัสพนักงาน</th><th>ชื่อ-สกุล</th><th>สังกัด</th><th>บทบาท</th><th>เครื่องมือค้างคืน</th><th>บัญชีเข้าระบบ</th><th></th></tr></thead>
             <tbody>
               {filtered.map(s => {
                 const open = tx.filter(t => t.staffId === s.id && !t.returnDate).length;
-                const hasAccount = users.some(u => u.staffId === s.id);
+                const linkedUser = users.find(u => u.staffId === s.id);
+                const hasAccount = !!linkedUser;
                 return (
                   <tr key={s.id}>
                     <td className="mono">{s.code}</td>
                     <td>{s.name}</td>
                     <td>{s.dept}</td>
+                    <td>
+                      {linkedUser?.role === 'admin' ? (
+                        <span className="badge purple" title={linkedUser.warehouseScope?.length ? `ดูแล: ${linkedUser.warehouseScope.map(id => warehouses.find(w => w.id === id)?.name).filter(Boolean).join(', ')}` : 'ยังไม่ได้กำหนดคลังที่ดูแล'}>
+                          แอดมินเสริม{linkedUser.warehouseScope ? ` (${linkedUser.warehouseScope.length} คลัง)` : ''}
+                        </span>
+                      ) : <span className="badge steel-badge">พนักงาน</span>}
+                    </td>
                     <td>{open > 0 ? <span className="badge warning">{open} รายการ</span> : <span className="badge success">ไม่มี</span>}</td>
                     <td>{hasAccount ? <span className="badge success">ใช้งานได้</span> : <span className="badge danger">ยังล็อกอินไม่ได้</span>}</td>
                     <td className="row-actions">
@@ -4160,7 +4308,7 @@ function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }
                   </tr>
                 );
               })}
-              {!filtered.length && <tr><td colSpan={6} className="empty-state">ไม่พบผู้ใช้งานที่ค้นหา</td></tr>}
+              {!filtered.length && <tr><td colSpan={7} className="empty-state">ไม่พบผู้ใช้งานที่ค้นหา</td></tr>}
             </tbody>
           </table>
         </div>
@@ -4168,7 +4316,7 @@ function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }
 
       {modal && (
         <Modal title={modal.mode === 'add' ? 'เพิ่มผู้ใช้งานใหม่' : 'แก้ไขผู้ใช้งาน'} onClose={() => setModal(null)}>
-          <StaffForm mode={modal.mode} data={modal.data} onSave={save} onCancel={() => setModal(null)} />
+          <StaffForm mode={modal.mode} data={modal.data} onSave={save} onCancel={() => setModal(null)} warehouses={warehouses} isMainAdmin={isMainAdmin} />
         </Modal>
       )}
 
@@ -4185,8 +4333,17 @@ function StaffPage({ staff, setStaff, tx, showToast, users, setUsers, addAudit }
   );
 }
 
-function StaffForm({ mode, data, onSave, onCancel }) {
+function StaffForm({ mode, data, onSave, onCancel, warehouses, isMainAdmin }) {
   const [form, setForm] = useState(data);
+  const isAdminRole = form.role === 'admin';
+  function toggleWarehouse(id) {
+    setForm(f => ({
+      ...f,
+      warehouseScope: (f.warehouseScope || []).includes(id)
+        ? f.warehouseScope.filter(x => x !== id)
+        : [...(f.warehouseScope || []), id],
+    }));
+  }
   return (
     <form onSubmit={e => { e.preventDefault(); onSave(form); }} className="modal-form">
       <div className="form-group">
@@ -4208,6 +4365,51 @@ function StaffForm({ mode, data, onSave, onCancel }) {
           {form.dept && !DEPT_OPTIONS.includes(form.dept) && <option value={form.dept}>{form.dept} (ค่าเดิม)</option>}
         </select>
       </div>
+      <div className="form-group">
+        <label>ลายเซ็น (สำหรับใบยืม-คืน LBC-FM-034)</label>
+        <input value={form.signature || ''} onChange={e => setForm({ ...form, signature: e.target.value })} placeholder="เช่น SUPHOT.B" />
+        <p className="muted" style={{ fontSize: 11.5, margin: '4px 0 0' }}>
+          จะถูกใช้เติมช่อง "Loan to (Mechanic)" ให้อัตโนมัติทุกครั้งที่คนนี้ยืมเครื่องมือ
+        </p>
+      </div>
+
+      {isMainAdmin && (
+        <>
+          <div className="loan-doc-section-title">สิทธิ์การใช้งาน</div>
+          <div className="form-group">
+            <label>บทบาท</label>
+            <div className="wh-switch">
+              <button type="button" className={`wh-switch-item ${!isAdminRole ? 'active' : ''}`} onClick={() => setForm({ ...form, role: 'staff' })}>พนักงาน</button>
+              <button type="button" className={`wh-switch-item ${isAdminRole ? 'active' : ''}`} onClick={() => setForm({ ...form, role: 'admin' })}>แอดมินเสริม</button>
+            </div>
+            <p className="muted" style={{ fontSize: 11.5, margin: '4px 0 0' }}>
+              เฉพาะแอดมินหลัก (Admin) เท่านั้นที่กำหนดบทบาทนี้ได้ — สร้างแอดมินเสริมได้ไม่จำกัดจำนวน
+            </p>
+          </div>
+          {isAdminRole && (
+            <div className="form-group">
+              <label>ขอบเขตคลังที่ดูแล</label>
+              {warehouses && warehouses.length ? (
+                <div className="shelf-pick-list">
+                  {warehouses.map(w => (
+                    <label key={w.id} className={`shelf-pick-row ${(form.warehouseScope || []).includes(w.id) ? 'checked' : ''}`}>
+                      <input type="checkbox" checked={(form.warehouseScope || []).includes(w.id)} onChange={() => toggleWarehouse(w.id)} />
+                      <span>{w.name}</span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <div className="hint bad">ยังไม่มีคลังเครื่องมือในระบบ</div>
+              )}
+              <p className="muted" style={{ fontSize: 11.5, margin: '4px 0 0' }}>
+                {(form.warehouseScope || []).length === 0
+                  ? '⚠️ ยังไม่ได้เลือกคลังใด — แอดมินเสริมคนนี้จะยังจัดการคลังไหนไม่ได้เลยจนกว่าจะเลือก'
+                  : `จะจัดการได้เฉพาะ ${(form.warehouseScope || []).length} คลังที่เลือกไว้เท่านั้น`}
+              </p>
+            </div>
+          )}
+        </>
+      )}
 
       {mode === 'add' ? (
         <>
