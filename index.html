@@ -4774,9 +4774,17 @@ const CSS = `
      only the card scrolling and the overlay centering via flex, a card taller
      than the visible viewport got its TOP clipped above the screen with no way
      to reach it — the overlay itself needs to be the thing that scrolls. */
+  /* z-index:80 — must sit above the mobile bottom tab bar (.sidebar at the
+     ≤640px breakpoint, z-index:60). It didn't before: on mobile the fixed
+     bottom nav rendered ON TOP of any open modal, visually covering — and
+     more importantly intercepting taps on — whatever sat in the last ~84px
+     of the modal, which is exactly where a form's submit button lives (e.g.
+     "ยืนยันการยืม" on the borrow-confirmation form). Scrolling the modal content
+     never helped because the nav bar was still there overlapping the bottom
+     of the screen regardless of scroll position. */
   .modal-overlay{
     position:fixed; inset:0; background:rgba(31,42,55,0.35); backdrop-filter:blur(2px);
-    display:flex; align-items:center; justify-content:center; z-index:50; padding:20px;
+    display:flex; align-items:center; justify-content:center; z-index:80; padding:20px;
     overflow-y:auto; -webkit-overflow-scrolling:touch;
   }
   .modal-card{
@@ -4803,7 +4811,7 @@ const CSS = `
 
   /* Toast */
   .toast{
-    position:fixed; bottom:24px; left:50%; transform:translateX(-50%); z-index:60;
+    position:fixed; bottom:24px; left:50%; transform:translateX(-50%); z-index:90;
     display:flex; align-items:center; gap:9px; padding:12px 20px; border-radius:14px; font-size:13.5px; font-weight:600;
     box-shadow:0 16px 40px rgba(31,42,55,0.2); animation:toastIn .2s ease-out; border:1px solid transparent;
   }
