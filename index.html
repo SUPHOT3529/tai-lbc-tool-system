@@ -509,7 +509,7 @@ function App() {
   const [users, setUsers] = useState([]);
   const [session, setSession] = useState(null); // { username, role, staffId }
   const [changePwOpen, setChangePwOpen] = useState(false);
-  const [settings, setSettingsState] = useState({ maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null });
+  const [settings, setSettingsState] = useState({ maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null, lastPhotoCleanupAt: null });
   const [auditLog, setAuditLog] = useState([]);
 
   useEffect(() => {
@@ -682,8 +682,8 @@ function App() {
         const staffData = s ? JSON.parse(s) : SEED_STAFF;
         const txData = x ? JSON.parse(x) : seedTx(toolsData, staffData);
         const settingsData = cfg
-          ? { maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null, ...JSON.parse(cfg) }
-          : { maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null };
+          ? { maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null, lastPhotoCleanupAt: null, ...JSON.parse(cfg) }
+          : { maxBorrowPerStaff: 3, defaultDueDays: 7, backupReminderDays: 7, lastBackupAt: null, lastPhotoCleanupAt: null };
         const auditData = log ? JSON.parse(log) : [];
         // Only seed (and write back) collections that genuinely came back empty on a
         // successful read — never as a reaction to a failed/thrown read (see the
@@ -797,6 +797,53 @@ function App() {
   const persistTx = useCallback((next) => persistCollection(STORAGE_KEYS.TX, next, setTx, true), [persistCollection]);
   const persistWarehouses = useCallback((next) => persistCollection(STORAGE_KEYS.WAREHOUSES, next, setWarehouses, true), [persistCollection]);
   const persistShelves = useCallback((next) => persistCollection(STORAGE_KEYS.SHELVES, next, setShelves, true), [persistCollection]);
+
+  // Evidence photos (borrow/return condition shots) are the single biggest
+  // consumer of database space in this system. Deliberately NOT automatic —
+  // the admin decides when and what to clear, after they've downloaded their
+  // own copy via the backup ZIP. `olderThanDays` (optional) lets them clear
+  // just the old stuff and keep recent cycles' photos on hand; omitting it
+  // clears everything currently stored. The transaction HISTORY itself is
+  // never touched here; only the photo files are removed, and any tx that
+  // had one gets `photosPurged: true` so the UI can say "this had a photo,
+  // it's just been cleared" instead of silently looking like one was never
+  // taken.
+  async function purgeEvidencePhotos(olderThanDays) {
+    const cutoff = olderThanDays ? addDays(todayISO(), -Number(olderThanDays)) : null;
+    let purgedCount = 0;
+    const purgedTxIds = new Set();
+    try {
+      const list = await window.storage.list('toolcrib-photo:', true);
+      for (const key of (list?.keys || [])) {
+        // key shape: toolcrib-photo:{txId}:borrow|return
+        const m = /^toolcrib-photo:([^:]+):(borrow|return)$/.exec(key);
+        const relatedTx = m ? tx.find(t => t.id === m[1]) : null;
+        if (cutoff && relatedTx) {
+          // Anchor the cutoff on whichever date the photo was actually taken.
+          const photoDate = m[2] === 'borrow' ? relatedTx.borrowDate : (relatedTx.returnDate || relatedTx.borrowDate);
+          if (photoDate && localISODate(parseDateValue(photoDate)) >= cutoff) continue; // newer than cutoff — keep it
+        }
+        await storageDelete(key, true);
+        purgedCount++;
+        if (m) purgedTxIds.add(m[1]);
+      }
+    } catch (err) {
+      console.error('failed to list/delete evidence photos', err);
+    }
+    if (purgedTxIds.size > 0) {
+      try {
+        await persistTx(tx.map(t => purgedTxIds.has(t.id) ? { ...t, photosPurged: true } : t));
+      } catch (err) {
+        console.error('failed to flag purged photos on tx history', err);
+      }
+    }
+    if (purgedCount > 0) {
+      try { await persistSettings({ ...settings, lastPhotoCleanupAt: new Date().toISOString() }); }
+      catch (err) { console.error('failed to record photo cleanup time', err); }
+      addAudit?.('photo_purge', `ลบรูปหลักฐานยืม-คืน ${purgedCount} รูป (แอดมินสั่งลบเอง${cutoff ? ` — เฉพาะที่เก่ากว่า ${olderThanDays} วัน` : ''})`);
+    }
+    return purgedCount;
+  }
 
   // Replays anything saved locally while offline back to the shared backend.
   // Stops at the first item that still fails (still offline, or backend
@@ -1194,7 +1241,8 @@ function App() {
             {page === 'settings' && isAdmin && (
               <SettingsPage settings={settings} setSettings={persistSettings} showToast={showToast} addAudit={addAudit}
                 tools={tools} setTools={persistTools} warehouses={warehouses} staff={staff} setStaff={persistStaff}
-                users={users} setUsers={persistUsers} tx={tx} toolStatus={toolStatus} />
+                users={users} setUsers={persistUsers} tx={tx} setTx={persistTx} toolStatus={toolStatus}
+                onPurgePhotos={purgeEvidencePhotos} isMainAdmin={isMainAdmin} />
             )}
           </>
         )}
@@ -1512,6 +1560,7 @@ function AuditPage({ auditLog }) {
     tool_damage_set: 'แจ้งชำรุด/ส่งซ่อม', tool_damage_clear: 'แจ้งซ่อมเสร็จ',
     tool_calib_send: 'ส่ง Calibration', tool_calib_receive: 'รับเข้าจาก Calibration',
     shelf_add: 'เพิ่มชั้นวาง', shelf_remove: 'ลบชั้นวาง', shelf_assign: 'จัดเครื่องมือเข้าชั้น', warehouse_import: 'นำเข้ารายการเครื่องมือ (ตามคลัง)',
+    photo_purge: 'ลบรูปหลักฐานยืม-คืน', history_delete: 'ลบประวัติยืม-คืนเก่า',
     staff_add: 'เพิ่มผู้ใช้งาน', staff_edit: 'แก้ไขผู้ใช้งาน', staff_delete: 'ลบผู้ใช้งาน',
     warehouse_add: 'เพิ่มคลังเครื่องมือ', warehouse_edit: 'แก้ไขคลังเครื่องมือ', warehouse_delete: 'ลบคลังเครื่องมือ', warehouse_export: 'ส่งออกข้อมูลคลัง',
     tools_export: 'ส่งออกรายการเครื่องมือ', data_backup: 'สำรองข้อมูลทั้งหมด', data_import: 'นำเข้าข้อมูลเครื่องมือ',
@@ -1552,13 +1601,19 @@ function AuditPage({ auditLog }) {
 }
 
 /* ---------------------------- Settings Page ---------------------------- */
-function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTools, warehouses, staff, setStaff, users, setUsers, tx, toolStatus }) {
+function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTools, warehouses, staff, setStaff, users, setUsers, tx, setTx, toolStatus, onPurgePhotos, isMainAdmin }) {
   const [form, setForm] = useState(settings);
   const [importPreview, setImportPreview] = useState(null); // { toAdd, toUpdate, errors }
   const [importBusy, setImportBusy] = useState(false);
   const fileInputRef = React.useRef(null);
   const [staffImportPreview, setStaffImportPreview] = useState(null);
   const [staffImportBusy, setStaffImportBusy] = useState(false);
+  const [purgeBusy, setPurgeBusy] = useState(false);
+  const [purgeDays, setPurgeDays] = useState('');
+  const [purgeConfirmOpen, setPurgeConfirmOpen] = useState(false);
+  const [historyDeleteDays, setHistoryDeleteDays] = useState(90);
+  const [historyDeleteBusy, setHistoryDeleteBusy] = useState(false);
+  const [historyConfirmOpen, setHistoryConfirmOpen] = useState(false);
   const staffFileInputRef = React.useRef(null);
   const [newAccounts, setNewAccounts] = useState(null); // temp-password results shown once after staff import
   const [backupBusy, setBackupBusy] = useState(false);
@@ -1582,6 +1637,46 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
     showToast('บันทึกการตั้งค่าเรียบร้อย', 'success');
   }
 
+  // Irreversible and scoped to the main admin only (enforced here too, not
+  // just by hiding the control in the UI) — only touches RETURNED items older
+  // than the cutoff, so nothing currently borrowed can ever be deleted out
+  // from under an active loan.
+  async function confirmPurgePhotos() {
+    setPurgeConfirmOpen(false);
+    setPurgeBusy(true);
+    const n = await onPurgePhotos?.(purgeDays ? Number(purgeDays) : undefined);
+    setPurgeBusy(false);
+    showToast(n > 0 ? `ลบรูปหลักฐาน ${n} รูปเรียบร้อย` : 'ไม่มีรูปหลักฐานให้ลบตามเงื่อนไขนี้', 'success');
+  }
+
+  async function deleteOldHistory() {
+    if (!isMainAdmin) return showToast('มีแต่แอดมินหลักเท่านั้นที่ลบประวัติได้', 'error');
+    const days = Number(historyDeleteDays);
+    if (!days || days < 1) return showToast('กรุณาระบุจำนวนวันให้ถูกต้อง', 'error');
+    const cutoff = addDays(todayISO(), -days);
+    const toDelete = tx.filter(t => t.returnDate && localISODate(parseDateValue(t.returnDate)) < cutoff);
+    setHistoryConfirmOpen(false);
+    if (!toDelete.length) return showToast('ไม่มีประวัติที่เก่ากว่าที่กำหนดให้ลบ', 'success');
+    setHistoryDeleteBusy(true);
+    const deleteIds = new Set(toDelete.map(t => t.id));
+    try {
+      await setTx(tx.filter(t => !deleteIds.has(t.id)));
+      // Evidence photos for the deleted transactions (if any survived an
+      // earlier purge) are cleaned up alongside the history rows themselves.
+      for (const t of toDelete) {
+        if (t.hasBorrowPhoto) await storageDelete(`toolcrib-photo:${t.id}:borrow`, true);
+        if (t.hasReturnPhoto) await storageDelete(`toolcrib-photo:${t.id}:return`, true);
+      }
+    } catch (err) {
+      console.error('failed to delete old history', err);
+      setHistoryDeleteBusy(false);
+      return showToast('ลบประวัติไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่', 'error');
+    }
+    setHistoryDeleteBusy(false);
+    addAudit?.('history_delete', `ลบประวัติยืม-คืนที่เก่ากว่า ${days} วัน (${toDelete.length} รายการ)`);
+    showToast(`ลบประวัติเก่าเรียบร้อย (${toDelete.length} รายการ)`, 'success');
+  }
+
   async function doFullBackup() {
     setBackupBusy(true);
     try {
@@ -1595,10 +1690,16 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
       wb.SheetNames.push('ประวัติยืม-คืน');
       wb.Sheets['ประวัติยืม-คืน'] = XLSX.utils.json_to_sheet(tx.map(t => {
         const tool = tools.find(x => x.id === t.toolId); const st = staff.find(x => x.id === t.staffId);
+        // Matches the exact filename each photo gets inside the "รูปหลักฐาน/"
+        // folder below (built from the same key), so a row here always points
+        // straight at its photo file(s) in this same ZIP — no separate lookup.
         return {
-          รหัสเครื่องมือ: tool?.code || '-', ผู้ยืม: st?.name || '-',
+          รหัสเครื่องมือ: tool?.code || '-', ชื่อเครื่องมือ: tool?.name || '-',
+          ผู้ยืม: st?.name || '-', สังกัด: st?.dept || '-',
           'วันเวลาที่ยืม': fmtThaiDateTime(t.borrowDate), กำหนดคืน: fmtThaiDate(t.dueDate),
-          'วันเวลาที่คืน': t.returnDate ? fmtThaiDateTime(t.returnDate) : 'ยังไม่คืน'
+          'วันเวลาที่คืน': t.returnDate ? fmtThaiDateTime(t.returnDate) : 'ยังไม่คืน',
+          'ไฟล์รูปก่อนยืม': t.hasBorrowPhoto && !t.photosPurged ? `รูปหลักฐาน/${t.id}_borrow.jpg` : (t.photosPurged ? 'ลบแล้ว' : '-'),
+          'ไฟล์รูปหลังยืม': t.hasReturnPhoto && !t.photosPurged ? `รูปหลักฐาน/${t.id}_return.jpg` : (t.photosPurged ? 'ลบแล้ว' : '-'),
         };
       }));
       const xlsxArrayBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
@@ -1889,6 +1990,84 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
         </div>
       </section>
 
+      <section className="panel">
+        <div className="panel-head">
+          <h2><ImageIcon size={16} /> รูปหลักฐานยืม-คืน & ประวัติการใช้งาน</h2>
+          <p>รูปก่อนยืม/หลังยืมทุกใบถูกเก็บไว้ในระบบเรื่อยๆ ไม่มีการลบอัตโนมัติใดๆ ทั้งสิ้น — แอดมินเป็นผู้บริหารจัดการเองทั้งหมดว่าจะดาวน์โหลดสำรองไว้เมื่อไร และจะลบรูปเก่าออกจากระบบเมื่อไร</p>
+        </div>
+        <div className="data-mgmt-block">
+          <div>
+            <div className="data-mgmt-title">สถานะการเก็บรูปหลักฐาน</div>
+            <div className="muted" style={{ fontSize: 12 }}>
+              สำรองข้อมูลล่าสุด: {settings.lastBackupAt ? fmtThaiDateTime(settings.lastBackupAt) : 'ยังไม่เคยสำรอง'}
+              {' · '}ลบรูปหลักฐานล่าสุด: {settings.lastPhotoCleanupAt ? fmtThaiDateTime(settings.lastPhotoCleanupAt) : 'ยังไม่เคยลบ'}
+            </div>
+            <div className="muted" style={{ fontSize: 11.5, marginTop: 2 }}>
+              แนะนำ: กด "สำรองข้อมูล (ZIP)" ด้านบนเพื่อดาวน์โหลดรูปหลักฐาน+ประวัติทั้งหมดเก็บไว้ก่อน แล้วค่อยลบรูปที่ไม่ต้องการเก็บในระบบต่อจากส่วนนี้
+            </div>
+          </div>
+        </div>
+        <div className="data-mgmt-block">
+          <div>
+            <div className="data-mgmt-title">ลบรูปหลักฐานที่เก่ากว่า...</div>
+            <div className="muted" style={{ fontSize: 12 }}>ลบเฉพาะไฟล์รูป (ประวัติยืม-คืนยังอยู่ครบ) — เว้นว่างจำนวนวันไว้เพื่อลบรูปทั้งหมดที่มีอยู่ตอนนี้</div>
+          </div>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <input type="number" min="0" placeholder="ทั้งหมด" style={{ width: 90 }} value={purgeDays} onChange={e => setPurgeDays(e.target.value)} />
+            <span className="muted" style={{ fontSize: 12.5 }}>วัน</span>
+            <button className="btn btn-secondary" disabled={purgeBusy} onClick={() => setPurgeConfirmOpen(true)}>
+              {purgeBusy ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />} ลบรูปหลักฐาน
+            </button>
+          </div>
+        </div>
+
+        {isMainAdmin && (
+          <div className="data-mgmt-block">
+            <div>
+              <div className="data-mgmt-title">ลบประวัติการยืม-คืน</div>
+              <div className="muted" style={{ fontSize: 12 }}>
+                ลบรายการประวัติยืม-คืนที่เก่ากว่าจำนวนวันที่กำหนดออกจากระบบถาวร (เฉพาะรายการที่คืนแล้วเท่านั้น) — เฉพาะแอดมินหลักเท่านั้นที่ทำรายการนี้ได้ และย้อนกลับไม่ได้
+              </div>
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input type="number" min="1" style={{ width: 80 }} value={historyDeleteDays} onChange={e => setHistoryDeleteDays(e.target.value)} />
+              <span className="muted" style={{ fontSize: 12.5 }}>วัน</span>
+              <button className="btn btn-secondary" style={{ borderColor: 'var(--danger)', color: 'var(--danger)' }}
+                disabled={historyDeleteBusy} onClick={() => setHistoryConfirmOpen(true)}>
+                {historyDeleteBusy ? <Loader2 className="spin" size={14} /> : <Trash2 size={14} />} ลบประวัติเก่า
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {purgeConfirmOpen && (
+        <Modal title="ยืนยันการลบรูปหลักฐาน" onClose={() => setPurgeConfirmOpen(false)}>
+          <p className="scanner-hint" style={{ background: 'var(--danger-tint)', color: 'var(--danger)', padding: '10px 12px', borderRadius: 10 }}>
+            {purgeDays
+              ? `จะลบเฉพาะรูปหลักฐานที่ถ่ายไว้ก่อน ${purgeDays} วันที่แล้ว — รูปที่ใหม่กว่านั้นจะยังอยู่ครบ`
+              : 'จะลบรูปหลักฐาน "ทั้งหมด" ที่มีอยู่ในระบบตอนนี้ (ทุกวัน ไม่มีการเว้น)'}
+            {' '}การลบนี้ถาวรและย้อนกลับไม่ได้ — ตรวจสอบให้แน่ใจว่าดาวน์โหลดสำรองข้อมูล (ZIP) เก็บไว้แล้วก่อนกดยืนยัน ประวัติยืม-คืนจะยังอยู่ในระบบเสมอ มีแค่ตัวรูปที่จะถูกลบ
+          </p>
+          <div className="form-actions" style={{ marginTop: 10 }}>
+            <button type="button" className="btn btn-secondary" onClick={() => setPurgeConfirmOpen(false)}>ยกเลิก</button>
+            <button type="button" className="btn btn-primary" style={{ background: 'var(--danger)' }} onClick={confirmPurgePhotos}>ยืนยันลบรูป</button>
+          </div>
+        </Modal>
+      )}
+
+      {historyConfirmOpen && (
+        <Modal title="ยืนยันการลบประวัติเก่า" onClose={() => setHistoryConfirmOpen(false)}>
+          <p className="scanner-hint" style={{ background: 'var(--danger-tint)', color: 'var(--danger)', padding: '10px 12px', borderRadius: 10 }}>
+            การลบนี้ถาวรและย้อนกลับไม่ได้ — จะลบเฉพาะรายการที่ "คืนแล้ว" และเก่ากว่า {historyDeleteDays || 0} วันเท่านั้น (รายการที่ยังค้างยืมอยู่จะไม่ถูกลบ)
+          </p>
+          <div className="form-actions" style={{ marginTop: 10 }}>
+            <button type="button" className="btn btn-secondary" onClick={() => setHistoryConfirmOpen(false)}>ยกเลิก</button>
+            <button type="button" className="btn btn-primary" style={{ background: 'var(--danger)' }} onClick={deleteOldHistory}>ยืนยันลบถาวร</button>
+          </div>
+        </Modal>
+      )}
+
       {importPreview && (
         <Modal title="ตรวจสอบก่อนนำเข้าข้อมูลเครื่องมือ" onClose={() => setImportPreview(null)}>
           <div className="confirm-summary">
@@ -1979,6 +2158,17 @@ function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, o
     setSnoozed(true);
   }
 
+  // Distinct from the general N-day reminder below: a same-day nudge from
+  // 16:00 onward to review/back up today's evidence photos. Purely
+  // informational now — nothing gets deleted automatically; managing what to
+  // keep or clear is entirely up to the admin, from the Settings page.
+  const photoReviewDue = useMemo(() => {
+    if (!isAdmin || !settings) return false;
+    if (new Date().getHours() < 16) return false;
+    if (!settings.lastBackupAt) return true;
+    return localISODate(parseDateValue(settings.lastBackupAt)) !== todayISO();
+  }, [isAdmin, settings]);
+
   const topTools = useMemo(() => {
     const counts = new Map();
     for (const t of tx) counts.set(t.toolId, (counts.get(t.toolId) || 0) + 1);
@@ -2022,6 +2212,23 @@ function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, o
 
   return (
     <div className="page-stack">
+      {photoReviewDue && (
+        <section className="panel backup-reminder-panel backup-reminder-urgent">
+          <div className="backup-reminder-text">
+            <ImageIcon size={18} />
+            <div>
+              <div className="backup-reminder-title">ถึงเวลาตรวจสอบรูปหลักฐานยืม-คืนของวันนี้แล้ว</div>
+              <div className="muted" style={{ fontSize: 12.5 }}>
+                รูปก่อนยืม/หลังยืมของวันนี้ยังเก็บอยู่ในระบบทั้งหมด ไม่มีการลบอัตโนมัติ — ไปที่หน้าตั้งค่าเพื่อดาวน์โหลดสำรองไว้ และเลือกลบรูปเก่าที่ไม่ต้องการเก็บแล้วได้ด้วยตัวเอง
+              </div>
+            </div>
+          </div>
+          <div className="backup-reminder-actions">
+            <button className="btn btn-primary" onClick={onGoSettings}><Download size={14} /> ไปจัดการรูปหลักฐาน</button>
+          </div>
+        </section>
+      )}
+
       {backupDue && !snoozed && (
         <section className="panel backup-reminder-panel">
           <div className="backup-reminder-text">
@@ -2615,14 +2822,26 @@ function TxTable({ rows, tools, staff, isAdmin, onViewPhoto, onEditTx, showPhoto
                       </button>
                     )}
                     {canSeePhotos && t.hasBorrowPhoto && (
-                      <button className="photo-chip chip-borrow" onClick={() => setPhotoModal({ txId: t.id, kind: 'borrow', label: `${tool?.code} (ก่อนยืม)` })}>
-                        <ImageIcon size={12} /> ก่อนยืม
-                      </button>
+                      t.photosPurged ? (
+                        <span className="photo-chip chip-purged" title="รูปถูกลบออกจากระบบแล้วเพื่อประหยัดพื้นที่ (มีสำเนาในไฟล์สำรองข้อมูลที่ดาวน์โหลดไว้)">
+                          <ImageIcon size={12} /> ก่อนยืม (ลบแล้ว)
+                        </span>
+                      ) : (
+                        <button className="photo-chip chip-borrow" onClick={() => setPhotoModal({ txId: t.id, kind: 'borrow', label: `${tool?.code} (ก่อนยืม)` })}>
+                          <ImageIcon size={12} /> ก่อนยืม
+                        </button>
+                      )
                     )}
                     {canSeePhotos && t.hasReturnPhoto && (
-                      <button className="photo-chip chip-return" onClick={() => setPhotoModal({ txId: t.id, kind: 'return', label: `${tool?.code} (หลังยืม)` })}>
-                        <ImageIcon size={12} /> หลังยืม
-                      </button>
+                      t.photosPurged ? (
+                        <span className="photo-chip chip-purged" title="รูปถูกลบออกจากระบบแล้วเพื่อประหยัดพื้นที่ (มีสำเนาในไฟล์สำรองข้อมูลที่ดาวน์โหลดไว้)">
+                          <ImageIcon size={12} /> หลังยืม (ลบแล้ว)
+                        </span>
+                      ) : (
+                        <button className="photo-chip chip-return" onClick={() => setPhotoModal({ txId: t.id, kind: 'return', label: `${tool?.code} (หลังยืม)` })}>
+                          <ImageIcon size={12} /> หลังยืม
+                        </button>
+                      )
                     )}
                     {isAdmin && t.docForm && (
                       <button className="photo-chip chip-doc" onClick={() => setDocModal(t)}>
@@ -4607,6 +4826,7 @@ const CSS = `
   .photo-chip.chip-return{ background:var(--purple-tint); color:var(--purple); }
   .photo-chip.chip-doc{ background:var(--amber-tint); color:#8A5A15; }
   .photo-chip.chip-off{ background:var(--line); color:var(--ink-soft); }
+  .photo-chip.chip-purged{ background:transparent; border:1px dashed var(--line); color:var(--ink-dim); cursor:default; }
   .photo-chip:hover{ opacity:0.8; }
   /* Loan-form column on the tools table: badge + optional download icon
      always sit on one tidy row, never stacking into a second line that
@@ -4901,6 +5121,8 @@ const CSS = `
   /* Overdue panel */
   .overdue-panel{ border-color:rgba(242,99,74,0.25); background:linear-gradient(180deg, var(--danger-tint), var(--card)); }
   .backup-reminder-panel{ display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; border-color:rgba(245,171,76,0.35); background:linear-gradient(180deg, var(--amber-tint), var(--card)); padding:16px 20px; }
+  .backup-reminder-panel.backup-reminder-urgent{ border-color:rgba(242,99,74,0.4); background:linear-gradient(180deg, var(--danger-tint), var(--card)); }
+  .backup-reminder-panel.backup-reminder-urgent .backup-reminder-text{ color:var(--danger); }
   .backup-reminder-text{ display:flex; align-items:flex-start; gap:10px; color:var(--amber); }
   .backup-reminder-text > div:last-child{ color:var(--ink); }
   .backup-reminder-title{ font-weight:700; font-size:14px; }
