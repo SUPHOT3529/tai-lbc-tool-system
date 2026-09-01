@@ -2098,6 +2098,12 @@ function WarehouseShadowBoard({ tools, warehouses, shelves, setShelves, setTools
   }, [warehouses, activeWh]);
 
   const [pickerShelf, setPickerShelf] = useState(null);
+  // Which tool's QR popover is currently open (one at a time, toggled by
+  // clicking its icon again) — a lightweight inline popover instead of the
+  // full modal, and only openable while the tool is actually on the shelf
+  // (status "available"); a borrowed/overdue/damaged/calibration item isn't
+  // meant to be scanned off the board right now.
+  const [openQrId, setOpenQrId] = useState(null);
   const [renamingId, setRenamingId] = useState(null);
   const [renameValue, setRenameValue] = useState('');
   const [busy, setBusy] = useState(false);
@@ -2313,8 +2319,15 @@ function WarehouseShadowBoard({ tools, warehouses, shelves, setShelves, setTools
                               <button className="shadow-slot-remove" title="นำออกจากชั้นนี้"
                                 onClick={(e) => { e.stopPropagation(); unassignTool(t); }}><X size={11} /></button>
                             )}
-                            <Icon size={22} strokeWidth={1.8} />
+                            <span
+                              className={`shadow-slot-icon ${status === 'available' ? 'clickable' : ''}`}
+                              title={status === 'available' ? `กดดู QR ของ ${t.name}` : 'ดู QR ได้เมื่อเครื่องมือพร้อมใช้งานอยู่บนชั้นเท่านั้น'}
+                              onClick={(e) => { e.stopPropagation(); if (status === 'available') setOpenQrId(id => id === t.id ? null : t.id); }}
+                            >
+                              <Icon size={22} strokeWidth={1.8} />
+                            </span>
                             <div className="slot-code">{t.code}</div>
+                            {openQrId === t.id && <ShelfQrPopover tool={t} onClose={() => setOpenQrId(null)} />}
                           </div>
                         );
                       })}
@@ -2341,8 +2354,15 @@ function WarehouseShadowBoard({ tools, warehouses, shelves, setShelves, setTools
                     : (catMap[t.category]?.icon || Package);
                   return (
                     <div key={t.id} className={`shadow-slot ${status}`} title={t.name}>
-                      <Icon size={22} strokeWidth={1.8} />
+                      <span
+                        className={`shadow-slot-icon ${status === 'available' ? 'clickable' : ''}`}
+                        title={status === 'available' ? `กดดู QR ของ ${t.name}` : 'ดู QR ได้เมื่อเครื่องมือพร้อมใช้งานอยู่บนชั้นเท่านั้น'}
+                        onClick={(e) => { e.stopPropagation(); if (status === 'available') setOpenQrId(id => id === t.id ? null : t.id); }}
+                      >
+                        <Icon size={22} strokeWidth={1.8} />
+                      </span>
                       <div className="slot-code">{t.code}</div>
+                      {openQrId === t.id && <ShelfQrPopover tool={t} onClose={() => setOpenQrId(null)} />}
                     </div>
                   );
                 })}
@@ -2364,6 +2384,54 @@ function WarehouseShadowBoard({ tools, warehouses, shelves, setShelves, setTools
         <ShelfAssignModal shelf={pickerShelf} tools={whTools} onSave={(ids) => assignTools(pickerShelf, ids)} onClose={() => setPickerShelf(null)} />
       )}
     </section>
+  );
+}
+
+// Small inline QR popover anchored to a single shelf slot — opened/closed by
+// clicking the same icon again (toggle), and dismissed on an outside click/tap.
+function ShelfQrPopover({ tool, onClose }) {
+  const holderRef = React.useRef(null);
+  const popRef = React.useRef(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    ensureQRCodeLib().then(() => {
+      if (cancelled || !holderRef.current || !window.QRCode) return;
+      holderRef.current.innerHTML = '';
+      try {
+        new window.QRCode(holderRef.current, {
+          text: tool.id, width: 120, height: 120,
+          colorDark: '#1F2A37', colorLight: '#FFFFFF',
+          correctLevel: window.QRCode.CorrectLevel.M
+        });
+      } catch (e) { setFailed(true); }
+    }).catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, [tool.id]);
+
+  useEffect(() => {
+    function onOutside(e) { if (popRef.current && !popRef.current.contains(e.target)) onClose(); }
+    // 'click' (not mousedown) matters here: the icon's own onClick calls
+    // stopPropagation before toggling, so re-clicking the SAME icon to close
+    // the popover never reaches this listener and race with the toggle — only
+    // a genuine click elsewhere closes it this way.
+    document.addEventListener('click', onOutside);
+    return () => {
+      document.removeEventListener('click', onOutside);
+    };
+  }, [onClose]);
+
+  return (
+    <div className="shelf-qr-pop" ref={popRef} onClick={e => e.stopPropagation()}>
+      <button className="shelf-qr-pop-close" onClick={onClose}><X size={12} /></button>
+      {failed ? (
+        <p className="muted" style={{ fontSize: 11, margin: 0 }}>สร้าง QR ไม่สำเร็จ</p>
+      ) : (
+        <div ref={holderRef} />
+      )}
+      <div className="shelf-qr-pop-code mono">{tool.code}</div>
+    </div>
   );
 }
 
@@ -4422,6 +4490,28 @@ const CSS = `
     background:var(--card); color:var(--ink-soft); display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:var(--shadow-sm);
   }
   .shadow-slot-remove:hover{ background:var(--danger-tint); color:var(--danger); border-color:var(--danger); }
+  /* The icon itself is the tap target for "show QR" — kept separate from the
+     small remove ("x") button sharing the same slot so the two never fight
+     over the same click. Only "available" tools get the pointer/hover cue;
+     everything else stays inert (borrowed/overdue/damaged/calibration items
+     aren't meant to be scanned off the board right now). */
+  .shadow-slot-icon{ display:flex; align-items:center; justify-content:center; border-radius:8px; padding:2px; }
+  .shadow-slot-icon.clickable{ cursor:pointer; }
+  .shadow-slot-icon.clickable:hover{ background:rgba(0,0,0,0.06); }
+
+  /* Inline QR popover, anchored to the slot it belongs to (the slot itself is
+     position:relative already) and floated above so it never gets clipped by
+     the row below it. */
+  .shelf-qr-pop{
+    position:absolute; bottom:calc(100% + 8px); left:50%; transform:translateX(-50%); z-index:40;
+    background:var(--card); border:1px solid var(--line); border-radius:14px; padding:12px;
+    box-shadow:0 16px 40px rgba(31,42,55,0.2); display:flex; flex-direction:column; align-items:center; gap:6px;
+  }
+  .shelf-qr-pop-close{
+    position:absolute; top:-8px; right:-8px; width:20px; height:20px; border-radius:50%; border:1px solid var(--line);
+    background:var(--card); color:var(--ink-soft); display:flex; align-items:center; justify-content:center; cursor:pointer; box-shadow:var(--shadow-sm);
+  }
+  .shelf-qr-pop-code{ font-size:11px; color:var(--ink-soft); }
 
   /* Shelf tool picker modal */
   .shelf-pick-list{ max-height:280px; overflow-y:auto; border:1px solid var(--line); border-radius:12px; }
