@@ -159,6 +159,30 @@ const CATEGORIES = [
   { id: 'other', label: 'อื่นๆ', icon: Package },
 ];
 const catMap = Object.fromEntries(CATEGORIES.map(c => [c.id, c]));
+
+// Sorts tool codes the way a person reading them would expect — by the
+// number embedded in the code, not plain string order (which would put
+// "AM4A12" before "AM4A2" since '1' < '2' as characters). Splits each code
+// into alternating letter/number chunks and compares numeric chunks as
+// numbers, letter chunks as text — regardless of what numbering scheme was
+// typed in, the display order always follows the code's own sequence.
+function naturalCompareCode(a, b) {
+  const chunks = (s) => String(s || '').match(/(\d+)|(\D+)/g) || [];
+  const ax = chunks(a), bx = chunks(b);
+  const len = Math.max(ax.length, bx.length);
+  for (let i = 0; i < len; i++) {
+    const av = ax[i] || '', bv = bx[i] || '';
+    const an = /^\d+$/.test(av), bn = /^\d+$/.test(bv);
+    if (an && bn) {
+      const diff = Number(av) - Number(bv);
+      if (diff !== 0) return diff;
+    } else {
+      const cmp = av.localeCompare(bv);
+      if (cmp !== 0) return cmp;
+    }
+  }
+  return 0;
+}
 const STATUS_NOTE = {
   borrowed: 'ถูกยืมอยู่',
   overdue: 'ถูกยืมอยู่และเกินกำหนดคืน',
@@ -2405,7 +2429,7 @@ function WarehouseShadowBoard({ tools, warehouses, scopedWarehouseIds, shelves, 
     [shelves, activeWh]);
   const whTools = useMemo(() => tools.filter(t => t.warehouseId === activeWh), [tools, activeWh]);
   const whShelfIds = new Set(whShelves.map(s => s.id));
-  const unassigned = whTools.filter(t => !t.shelfId || !whShelfIds.has(t.shelfId));
+  const unassigned = whTools.filter(t => !t.shelfId || !whShelfIds.has(t.shelfId)).sort((a, b) => naturalCompareCode(a.code, b.code));
 
   async function addShelf() {
     if (!activeWarehouse) return;
@@ -2812,7 +2836,7 @@ function WarehouseShadowBoard({ tools, warehouses, scopedWarehouseIds, shelves, 
       {detailShelf && (
         <ShelfDetailModal
           shelf={detailShelf}
-          tools={whTools.filter(t => t.shelfId === detailShelf.id)}
+          tools={whTools.filter(t => t.shelfId === detailShelf.id).sort((a, b) => naturalCompareCode(a.code, b.code))}
           toolStatus={toolStatus}
           isAdmin={isAdmin}
           onUnassign={unassignTool}
@@ -3042,7 +3066,8 @@ function ShelfAssignModal({ shelf, tools, onSave, onClose }) {
   // shelf first before it can be added elsewhere, so there's exactly one
   // place to look for it at any time and no silent cross-shelf move.
   const options = tools.filter(t => !t.shelfId &&
-    (t.name.toLowerCase().includes(query.toLowerCase()) || t.code.toLowerCase().includes(query.toLowerCase())));
+    (t.name.toLowerCase().includes(query.toLowerCase()) || t.code.toLowerCase().includes(query.toLowerCase())))
+    .sort((a, b) => naturalCompareCode(a.code, b.code));
 
   function toggle(id) {
     setSelected(sel => sel.includes(id) ? sel.filter(x => x !== id) : (sel.length >= capLeft ? sel : [...sel, id]));
@@ -4102,7 +4127,7 @@ function QrToolPage({ tools, warehouses, toolStatus }) {
   const [qrTool, setQrTool] = useState(null);
 
   const wh = warehouses.find(w => w.id === whId);
-  const whTools = useMemo(() => tools.filter(t => t.warehouseId === whId), [tools, whId]);
+  const whTools = useMemo(() => tools.filter(t => t.warehouseId === whId).sort((a, b) => naturalCompareCode(a.code, b.code)), [tools, whId]);
   const filtered = useMemo(() => {
     const query = q.trim().toLowerCase();
     if (!query) return whTools;
