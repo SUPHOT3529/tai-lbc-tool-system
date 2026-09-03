@@ -135,7 +135,7 @@ import {
   Wifi, WifiOff, Gauge, Upload, Layers, LayoutGrid, Lightbulb, Calendar, RefreshCw, ChevronLeft
 } from 'lucide-react';
 import {
-  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, CartesianGrid, Legend
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, CartesianGrid, Legend, LabelList
 } from 'recharts';
 
 /* ---------------------------------------------------------------
@@ -2839,11 +2839,11 @@ function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, o
   // warehouse's health at a glance rather than one combined total across
   // every warehouse, which hides which specific location has a problem.
   const STATUS_META = [
-    { key: 'available', label: 'พร้อมใช้งาน', color: '#33B9A4' },
-    { key: 'borrowed', label: 'ถูกยืม', color: '#F5AB4C' },
-    { key: 'overdue', label: 'เกินกำหนดคืน', color: '#E0523F' },
-    { key: 'damaged', label: 'ชำรุด/ส่งซ่อม', color: '#8B7FF0' },
-    { key: 'calibration', label: 'ส่ง Calibration', color: '#4FA7E0' },
+    { key: 'available', label: 'พร้อมใช้งาน', color: '#33B9A4', icon: CheckCircle2 },
+    { key: 'borrowed', label: 'ถูกยืม', color: '#F5AB4C', icon: Clock },
+    { key: 'overdue', label: 'เกินกำหนดคืน', color: '#E0523F', icon: AlertTriangle },
+    { key: 'damaged', label: 'ชำรุด/ส่งซ่อม', color: '#8B7FF0', icon: ShieldAlert },
+    { key: 'calibration', label: 'ส่ง Calibration', color: '#4FA7E0', icon: Gauge },
   ];
   const whStatusDist = useMemo(() => {
     return (warehouses || []).map(w => {
@@ -2853,6 +2853,7 @@ function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, o
         const s = toolStatus(t.id);
         if (row[s] !== undefined) row[s]++;
       });
+      row.total = STATUS_META.reduce((sum, s) => sum + row[s.key], 0);
       return row;
     });
   }, [tools, warehouses, toolStatus]);
@@ -2984,15 +2985,19 @@ function Dashboard({ kpis, tools, staff, tx, toolStatus, overdueList, isAdmin, o
           <div className="panel chart-panel">
             <div className="panel-head"><h2><Building2 size={16} /> สถานะเครื่องมือแยกตามคลัง</h2></div>
             {whStatusDist.length ? (
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={whStatusDist} margin={{ top: 4, right: 8, left: -20, bottom: 0 }}>
+              <ResponsiveContainer width="100%" height={260}>
+                <BarChart data={whStatusDist} margin={{ top: 24, right: 8, left: -20, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" vertical={false} />
                   <XAxis dataKey="name" tick={{ fontSize: 10.5, fill: 'var(--ink-soft)' }} axisLine={{ stroke: 'var(--line)' }} tickLine={false} interval={0} angle={-15} textAnchor="end" height={40} />
                   <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: 'var(--ink-soft)' }} axisLine={false} tickLine={false} />
-                  <Tooltip contentStyle={{ borderRadius: 10, border: '1px solid var(--line)', fontSize: 12 }} />
-                  <Legend wrapperStyle={{ fontSize: 10.5 }} formatter={(key) => STATUS_META.find(s => s.key === key)?.label || key} />
-                  {STATUS_META.map(s => (
-                    <Bar key={s.key} dataKey={s.key} stackId="status" fill={s.color} name={s.key} radius={s.key === 'calibration' ? [6, 6, 0, 0] : 0} maxBarSize={44} />
+                  <Tooltip content={<WhStatusTooltip statusMeta={STATUS_META} />} />
+                  <Legend wrapperStyle={{ fontSize: 10.5 }} content={<WhStatusLegend statusMeta={STATUS_META} />} />
+                  {STATUS_META.map((s, i) => (
+                    <Bar key={s.key} dataKey={s.key} stackId="status" fill={s.color} name={s.key} radius={s.key === 'calibration' ? [6, 6, 0, 0] : 0} maxBarSize={44}>
+                      {i === STATUS_META.length - 1 && (
+                        <LabelList content={(props) => <WhStatusTotalLabel {...props} rows={whStatusDist} />} />
+                      )}
+                    </Bar>
                   ))}
                 </BarChart>
               </ResponsiveContainer>
@@ -3847,6 +3852,58 @@ function ShelfAssignModal({ shelf, tools, onSave, onClose }) {
         </button>
       </div>
     </Modal>
+  );
+}
+
+// Custom tooltip for the warehouse-status stacked bar — an icon next to each
+// status line (rather than just a colored square) so it reads at a glance.
+function WhStatusTooltip({ active, payload, label, statusMeta }) {
+  if (!active || !payload || !payload.length) return null;
+  const row = payload[0]?.payload;
+  if (!row) return null;
+  return (
+    <div className="wh-status-tooltip">
+      <div className="wh-status-tooltip-title">{label}</div>
+      {statusMeta.map(s => {
+        const Icon = s.icon;
+        return (
+          <div key={s.key} className="wh-status-tooltip-row">
+            <Icon size={13} style={{ color: s.color, flexShrink: 0 }} />
+            <span>{s.label}</span>
+            <b style={{ color: s.color }}>{row[s.key] ?? 0}</b>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Same icon treatment for the legend below the chart.
+function WhStatusLegend({ statusMeta }) {
+  return (
+    <div className="wh-status-legend">
+      {statusMeta.map(s => {
+        const Icon = s.icon;
+        return (
+          <span key={s.key} className="wh-status-legend-item">
+            <Icon size={13} style={{ color: s.color }} /> {s.label}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+// Draws "รวม N ชิ้น" above the top of each stacked bar — Recharts' built-in
+// LabelList would only show that one segment's own value, so this looks up
+// the row's precomputed total instead.
+function WhStatusTotalLabel({ x, y, width, index, rows }) {
+  const total = rows?.[index]?.total;
+  if (!total) return null;
+  return (
+    <text x={x + width / 2} y={y - 8} textAnchor="middle" fontSize={11} fontWeight={700} fill="var(--ink)">
+      รวม {total}
+    </text>
   );
 }
 
@@ -4922,7 +4979,13 @@ function QrToolPage({ tools, warehouses, shelves, toolStatus }) {
     const CatIcon = catMap[t.category]?.icon || Package;
     return (
       <div key={t.id} className="qrtool-row">
-        <div className="qrtool-row-icon"><CatIcon size={17} /></div>
+        {t.hasPhoto ? (
+          <div className="qrtool-row-photo">
+            <ToolPhotoThumb toolId={t.id} hasPhoto={true} size={36} version={t.photoUpdatedAt} />
+          </div>
+        ) : (
+          <div className="qrtool-row-icon"><CatIcon size={17} /></div>
+        )}
         <div className="qrtool-row-info">
           <div className="qrtool-row-name">{t.name}</div>
           <div className="qrtool-row-code mono">{t.code}</div>
@@ -6848,6 +6911,13 @@ const CSS = `
   .kpi-label{ font-size:12px; color:var(--ink-soft); margin-bottom:3px; }
   .kpi-value{ font-size:25px; font-weight:600; color:var(--ink); }
 
+  .wh-status-tooltip{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; box-shadow:var(--shadow-md); min-width:160px; }
+  .wh-status-tooltip-title{ font-size:13px; font-weight:700; color:var(--ink); margin-bottom:8px; }
+  .wh-status-tooltip-row{ display:flex; align-items:center; gap:7px; font-size:12px; color:var(--ink-soft); padding:3px 0; }
+  .wh-status-tooltip-row span{ flex:1; }
+  .wh-status-legend{ display:flex; flex-wrap:wrap; justify-content:center; gap:12px; margin-top:6px; }
+  .wh-status-legend-item{ display:flex; align-items:center; gap:5px; font-size:10.5px; color:var(--ink-soft); }
+
   /* Panel */
   .panel{ background:var(--card); border:1px solid var(--line); border-radius:var(--radius); padding:16px 18px; box-shadow:var(--shadow-sm); }
   .panel-head h2{ font-size:15.5px; font-weight:600; display:flex; align-items:center; gap:8px; color:var(--ink); }
@@ -7170,6 +7240,8 @@ const CSS = `
   .qrtool-list{ display:flex; flex-direction:column; gap:8px; margin-top:12px; }
   .qrtool-row{ display:flex; align-items:center; gap:12px; background:var(--card-soft); border:1px solid var(--line); border-radius:14px; padding:10px 14px; flex-wrap:wrap; }
   .qrtool-row-icon{ width:36px; height:36px; border-radius:10px; background:var(--teal-tint); color:var(--teal-deep); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
+  .qrtool-row-photo{ width:36px; height:36px; flex-shrink:0; }
+  .qrtool-row-photo .tool-master-photo, .qrtool-row-photo .tool-master-photo-placeholder{ margin:0; border-radius:10px; }
   .qrtool-row-info{ flex:1; min-width:120px; }
   .qrtool-row-name{ font-size:13.5px; font-weight:600; color:var(--ink); }
   .qrtool-row-code{ font-size:12px; color:var(--ink-soft); margin-top:1px; }
