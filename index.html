@@ -1996,15 +1996,15 @@ function App() {
               <span>Export Excel</span>
             </button>
           )}
+          {/* Phone only. On a phone the top bar scrolls away with the page, so
+              signing out meant scrolling back up. Here it is simply the last
+              item of the bottom menu — same shape, same size, same behaviour as
+              every other entry, just tinted red because of what it does. */}
+          <button type="button" className="nav-item nav-item-power" onClick={() => setLogoutConfirm(true)}>
+            <span className="nav-item-icon tone-danger"><Power size={16} strokeWidth={2.4} /></span>
+            <span>ออกจากระบบ</span>
+          </button>
         </nav>
-        {/* Second copy of the power switch, shown only on phones. The bar at the
-            bottom is fixed; the top bar it normally lives in scrolls away with
-            the page, so on a phone you had to scroll back up to sign out. Pinned
-            to the right end here so the nav can scroll past it and it stays put. */}
-        <button type="button" className="power-switch power-switch-bar" onClick={() => setLogoutConfirm(true)}
-          title="ออกจากระบบ" aria-label="ออกจากระบบ">
-          <Power size={18} strokeWidth={2.6} />
-        </button>
       </aside>
 
       <main className="main">
@@ -3080,20 +3080,6 @@ function SettingsPage({ settings, setSettings, showToast, addAudit, tools, setTo
                 {backupPdfBusy ? <Loader2 size={16} className="spin" /> : <FileSpreadsheet size={16} />}
                 <span className="dm-card-btn-label">สรุปข้อมูล (PDF)<small>{backupPdfBusy ? 'กำลังสร้างไฟล์…' : 'จัดหน้า A4 พร้อมพิมพ์'}</small></span>
               </button>
-            </div>
-            <div className="dm-card-note tone-neutral">
-              <Layers size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-              <span>
-                {window.showSaveFilePicker
-                  ? 'กดแล้วเลือกโฟลเดอร์/ไดรฟ์ที่ต้องการบันทึกได้เลย'
-                  : (navigator.canShare
-                      ? 'กดแล้วเลือก "บันทึกลงใน Files" เพื่อเลือกตำแหน่งบันทึกเอง'
-                      : 'ไฟล์จะถูกบันทึกลงโฟลเดอร์ดาวน์โหลดของเบราว์เซอร์')}
-              </span>
-            </div>
-            <div className="dm-card-note tone-green">
-              <ShieldCheck size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-              <span><b>แนะนำ</b> ควรสำรองข้อมูลเป็นประจำ เพื่อป้องกันข้อมูลสูญหาย</span>
             </div>
           </div>
 
@@ -8159,7 +8145,16 @@ const CSS = `
   /* align-items:start stops a short card from being stretched to match a tall
      neighbour — which is what left the code-cleanup card as a mostly empty box
      with its one button stranded at the bottom. */
-  .dm-grid{ display:grid; grid-template-columns:repeat(2,1fr); gap:16px; align-items:start; }
+  /* Back to stretch, but with the internals doing the balancing: every card
+     shares a fixed-height description block and pushes its buttons onto a
+     common baseline, so the four cards line up as a grid instead of four
+     boxes of different heights with ragged button rows. */
+  .dm-grid{ display:grid; grid-template-columns:repeat(2,1fr); gap:16px; align-items:stretch; }
+  /* Three lines of description in every card. Shorter text leaves white space
+     rather than shifting the buttons up out of alignment with its neighbour. */
+  .dm-card-desc{ min-height:60px; }
+  .dm-card-btn{ flex:1 1 0; min-width:0; }
+  .dm-card-btn-label{ min-width:0; }
   .dm-card-select{ width:100%; height:44px; padding:0 12px; margin-bottom:8px; border-radius:12px;
     border:1px solid var(--line); background:var(--card); color:var(--ink); font-family:inherit; font-size:13px; }
   .dm-card-select:disabled{ opacity:0.6; }
@@ -8182,7 +8177,7 @@ const CSS = `
   .dm-card-desc{ font-size:12.5px; color:var(--ink-soft); line-height:1.6; }
   /* No margin-top:auto: with cards no longer stretched to a shared height,
      pushing the buttons to the bottom only re-created the empty gap. */
-  .dm-card-actions{ display:flex; gap:8px; flex-wrap:wrap; padding-top:4px; }
+  .dm-card-actions{ display:flex; gap:8px; flex-wrap:wrap; margin-top:auto; padding-top:4px; }
   .dm-card-btn{ display:flex; align-items:center; gap:9px; border-radius:12px; padding:9px 14px; font-size:13px; font-weight:700; cursor:pointer; border:1px solid transparent; background:var(--card-soft); color:var(--ink); }
   .dm-card-btn.tone-green{ background:var(--teal-tint); color:var(--teal-deep); }
   .dm-card-btn.tone-blue{ background:var(--info-tint); color:var(--info); }
@@ -8240,7 +8235,8 @@ const CSS = `
   .power-switch:active{ transform:scale(0.94); }
 
   /* Only ever visible in the phone bottom bar — see the 640px block. */
-  .power-switch-bar{ display:none; }
+  .nav-item-power{ display:none; }
+  .nav-item-power .nav-item-icon{ background:var(--danger-tint); color:var(--danger); }
 
   .user-menu-wrap{ position:relative; }
   .user-card{ display:flex; align-items:center; gap:10px; background:var(--card); border:1px solid var(--line); padding:6px 10px 6px 6px; border-radius:30px; box-shadow:var(--shadow-sm); font-family:inherit; cursor:pointer; }
@@ -8900,19 +8896,17 @@ const CSS = `
      phone app would, and reclaim the top of the screen for content. */
   @media (max-width: 640px){
     .app-body{ padding-bottom:0; }
-    /* The scrolling moved from the bar itself to the nav list inside it, so the
-       power switch can sit outside the scroller and stay pinned at the right. */
     .sidebar{
       position:fixed; left:0; right:0; bottom:0; top:auto; z-index:60; width:100%; max-width:100%;
       flex-direction:row; flex-wrap:nowrap; align-items:center; justify-content:flex-start;
-      overflow:hidden;
-      padding:6px 8px; gap:6px; border-top:1px solid var(--line);
+      overflow-x:auto;
+      padding:6px 8px; gap:4px; border-top:1px solid var(--line);
       background:var(--card); box-shadow:0 -8px 24px rgba(31,42,55,0.10);
     }
     .sidebar .brand{ display:none; }
-    .nav-list{ flex:1; min-width:0; flex-direction:row; flex-wrap:nowrap; gap:2px; overflow-x:auto; }
-    .power-switch-bar{ display:flex; flex-shrink:0; width:44px; height:44px; }
-    /* The top-bar copy would be a duplicate on a phone. */
+    .nav-list{ flex-direction:row; flex-wrap:nowrap; gap:2px; }
+    .nav-item-power{ display:flex; }
+    /* One switch per screen: the top-bar copy would be a second one here. */
     .topbar .power-switch{ display:none; }
     .nav-item{ flex-direction:column; gap:2px; padding:7px 11px; font-size:10.5px; white-space:nowrap; border-radius:12px; }
     .nav-item span{ font-size:10.5px; }
