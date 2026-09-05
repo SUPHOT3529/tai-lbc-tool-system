@@ -107,6 +107,22 @@
   // Changes the password of the account currently signed in on the MAIN client.
   // Only ever the person's own password — Supabase does not allow changing
   // somebody else's from a browser, by design.
+  // Brings an account that predates the migration across to Supabase Auth, using
+  // the password the person has just chosen. Called when someone changes their
+  // own password and turns out not to have a Supabase account yet — which is
+  // every account created before this system existed. It is the only moment the
+  // browser legitimately knows a plaintext password for that person, so it is
+  // the only moment the account can be created without a server-side key.
+  window.taiAuthEnsureAccount = async function (username, password) {
+    const created = await window.taiAuthCreateAccount(username, password);
+    if (!created.ok) return created;
+    // Creating the account does not sign this browser in (that runs on the
+    // isolated client). Sign in properly so the device ends up holding a real
+    // database token rather than staying on the legacy path until next login.
+    const signedIn = await window.taiAuthSignIn(username, password);
+    return { ok: true, existed: created.existed, signedIn: signedIn.ok };
+  };
+
   window.taiAuthUpdateOwnPassword = async function (newPassword) {
     try {
       const { data } = await sb.auth.getUser();
@@ -1273,12 +1289,21 @@ function App() {
       console.error('failed to change password', err);
       return { ok: false, error: 'บันทึกไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่' };
     }
-    // Keep the Supabase password in step. Skipped silently when this device is
-    // still signed in the legacy way — there is no Supabase session to update,
-    // and failing the whole change over that would block people from setting a
-    // password at all during the migration.
+    // Keep Supabase in step. Two cases:
+    //   - already signed in there → just change the password;
+    //   - not signed in (an account from before the migration) → create the
+    //     Supabase account now, with the password they just chose, and sign in.
+    // This is what moves the existing staff across without anyone deleting and
+    // re-adding accounts: each person changes their password once and they are
+    // migrated.
     const supaPw = await window.taiAuthUpdateOwnPassword?.(newPassword);
-    if (supaPw && !supaPw.ok && !supaPw.notSignedIn) {
+    if (supaPw && supaPw.notSignedIn) {
+      const ensured = await window.taiAuthEnsureAccount?.(match.username, newPassword);
+      if (ensured && !ensured.ok) {
+        console.error('failed to create supabase account on password change', ensured.error);
+        return { ok: true, warning: 'เปลี่ยนรหัสในระบบเรียบร้อย แต่ยังสร้างบัญชีในระบบล็อกอินใหม่ไม่สำเร็จ กรุณาแจ้งแอดมินหลัก' };
+      }
+    } else if (supaPw && !supaPw.ok) {
       console.error('failed to update supabase password', supaPw.error);
       return { ok: true, warning: 'เปลี่ยนรหัสในระบบเรียบร้อย แต่ยังอัปเดตในระบบล็อกอินใหม่ไม่สำเร็จ กรุณาแจ้งแอดมินหลัก' };
     }
@@ -2103,8 +2128,16 @@ function App() {
         <style>{CSS}</style>
         <ForcePasswordChangeScreen
           user={currentUserRecord}
-          onDone={async (newHash) => {
+          onDone={async (newHash, newPassword) => {
             await persistUsers(users.map(u => u.id === currentUserRecord.id ? { ...u, passwordHash: newHash, mustChangePassword: false } : u));
+            // Same migration hook as the ordinary change-password flow. Without
+            // it, an account created before the migration that is forced to set
+            // a password on first login would set it in the old store only and
+            // still have no Supabase account at all.
+            const supaPw = await window.taiAuthUpdateOwnPassword?.(newPassword);
+            if (supaPw && supaPw.notSignedIn) {
+              await window.taiAuthEnsureAccount?.(currentUserRecord.username, newPassword);
+            }
           }}
           onLogout={logout}
         />
@@ -2336,7 +2369,10 @@ function ForcePasswordChangeScreen({ user, onDone, onLogout }) {
     setBusy(true); setError('');
     try {
       const newHash = await hashPassword(pw1);
-      await onDone(newHash);
+      // The plaintext goes along with the hash: the caller needs it to create
+      // or update the matching Supabase account, which cannot be done from a
+      // hash. It never leaves this browser.
+      await onDone(newHash, pw1);
     } catch (err) {
       console.error('failed to set new password', err);
       setError('บันทึกไม่สำเร็จ เชื่อมต่อฐานข้อมูลไม่ได้ กรุณาลองใหม่');
